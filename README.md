@@ -58,13 +58,21 @@ sudo apt install v4l2loopback-dkms
 # 2. The package (latest build of the dev branch)
 wget https://github.com/SamuelSchwertfeger/ov02c10-camera-fix/releases/download/dev-latest/ov02c10-camera_amd64.deb
 sudo apt install ./ov02c10-camera_amd64.deb
-
-# 3. Start it now and at every login
-systemctl --user enable --now ov02c10-camera
 ```
 
-Open a camera test page or a call: "OV02C10 Camera" appears in the picker,
-and the sensor starts when the application starts using it.
+That is all: installing enables the service for every user and starts it for
+users logged in now (an upgrade restarts it with the new binary). Open a
+camera test page or a call: "OV02C10 Camera" appears in the picker, and the
+sensor and LED only turn on while an application is streaming from it.
+
+To see how it detects applications using the camera:
+`journalctl --user -u ov02c10-camera -b | grep -i "reader events"`. A match
+means the loaded v4l2loopback lacks reader events and readers are found by
+open handles instead. In that mode any application that keeps the camera
+open counts, even when it is not streaming, and apps reaching the camera
+through PipeWire are not detected. To get events, replace the module with a
+newer one: `sudo apt remove v4l2loopback-dkms`, then `./scripts/setup.sh`
+(it only builds when no v4l2loopback module is installed), and reboot.
 
 The package installs the binary, the systemd `--user` unit, a udev rule
 giving the logged-in user access to the camera nodes, and a modprobe
@@ -87,7 +95,7 @@ Things to know:
 
 ```bash
 make setup     # v4l-utils, cargo, v4l2loopback (needs sudo)
-make install   # build, package, install, start the service
+make install   # build, package, install (the package enables and starts the service)
 ```
 
 Needs Rust 1.85 or newer (Debian 13's `cargo` is enough).

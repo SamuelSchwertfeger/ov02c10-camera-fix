@@ -49,8 +49,8 @@ impl Default for Config {
             sensor_width: 1928,
             sensor_height: 1092,
             sensor_format: "SGRBG10_1X10".into(),
-            output_width: 1280,
-            output_height: 720,
+            output_width: 1920,
+            output_height: 1080,
             loopback_device: "/dev/video48".into(),
             num_buffers: 4,
             analogue_gain: 150,
@@ -80,8 +80,8 @@ OPTIONS:
     --device <PATH>            Capture device            [/dev/video32]
     --media-device <PATH>      Media controller device   [/dev/media0]
     --loopback-device <PATH>   v4l2loopback device       [/dev/video48]
-    --width <PX>               Output width (even)       [1280]
-    --height <PX>              Output height             [720]
+    --width <PX>               Output width (even)       [1920]
+    --height <PX>              Output height             [1080]
     --analogue-gain <16-248>   Starting analogue gain    [150]
     --digital-gain <1024-16383>  Digital gain            [4096]
     --no-auto-exposure         Keep analogue gain fixed
@@ -161,8 +161,8 @@ mod tests {
         assert_eq!(cfg.sensor_format, "SGRBG10_1X10");
         assert_eq!(cfg.analogue_gain, 150);
         assert_eq!(cfg.digital_gain, 4096);
-        assert_eq!(cfg.output_width, 1280);
-        assert_eq!(cfg.output_height, 720);
+        assert_eq!(cfg.output_width, 1920);
+        assert_eq!(cfg.output_height, 1080);
         assert!(cfg.auto_exposure);
     }
 

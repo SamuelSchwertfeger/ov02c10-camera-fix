@@ -63,10 +63,36 @@ if [ "$1" = configure ]; then
     modprobe v4l2loopback 2>/dev/null ||
         echo "ov02c10-camera: v4l2loopback kernel module not available yet (see the README)" >&2
     udevadm trigger --subsystem-match=video4linux --subsystem-match=media 2>/dev/null || true
-    echo "ov02c10-camera: enable it for your user with: systemctl --user enable --now ov02c10-camera"
+    if command -v systemctl >/dev/null 2>&1; then
+        # Enabled for every user at login; also (re)start it for users who
+        # are logged in now so no logout is needed. Never fails the install.
+        systemctl --global enable ov02c10-camera.service 2>/dev/null || true
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl list-users --no-legend 2>/dev/null | while read -r _ user _; do
+                systemctl --user --machine="$user@.host" daemon-reload 2>/dev/null || true
+                systemctl --user --machine="$user@.host" restart ov02c10-camera.service 2>/dev/null ||
+                    echo "ov02c10-camera: not started for $user; it starts at their next login (or: systemctl --user start ov02c10-camera)"
+            done || true
+        fi
+    fi
+    echo "ov02c10-camera: enabled for all users; the camera sensor only turns on while an app uses it"
 fi
 EOF
 chmod 755 "$PKG/DEBIAN/postinst"
+
+cat >"$PKG/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = remove ] && command -v systemctl >/dev/null 2>&1; then
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl list-users --no-legend 2>/dev/null | while read -r _ user _; do
+            systemctl --user --machine="$user@.host" stop ov02c10-camera.service 2>/dev/null || true
+        done || true
+    fi
+    systemctl --global disable ov02c10-camera.service 2>/dev/null || true
+fi
+EOF
+chmod 755 "$PKG/DEBIAN/prerm"
 
 mkdir -p "$OUT"
 dpkg-deb --root-owner-group --build "$PKG" "$OUT/ov02c10-camera_amd64.deb"

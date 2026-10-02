@@ -38,14 +38,13 @@ fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
-/// A running sensor stream that turns raw frames into BGRx.
+/// A running sensor stream that turns raw frames into calibrated Bayer.
 struct Stream {
     cam: Capture,
     sensor: Sensor,
     ae: Option<AutoExposure>,
     debayer: Debayer,
     bayer: Vec<u8>,
-    bgrx: Vec<u8>,
     /// Until exposure has converged and white balance is measured, frames
     /// are held back.
     calibrating: bool,
@@ -77,7 +76,6 @@ impl Stream {
                 .then(|| AutoExposure::new(analogue_gain, cfg.ae_target)),
             debayer: Debayer::new(w, h, cfg.output_width, cfg.output_height),
             bayer: vec![0; w * h],
-            bgrx: vec![0; cfg.output_width * cfg.output_height * 4],
             calibrating: true,
             settle: 0,
             frame_no: 0,
@@ -92,7 +90,7 @@ impl Stream {
         self.ae.as_ref().map_or(cfg.analogue_gain, |ae| ae.gain)
     }
 
-    /// Process one sensor frame. True when `self.bgrx` holds a new image.
+    /// Process one sensor frame. True when `self.bayer` holds a new calibrated frame.
     fn next(&mut self, cfg: &Config) -> io::Result<bool> {
         let (w, h, stride) = (cfg.sensor_width, cfg.sensor_height, self.cam.stride);
         let bayer = &mut self.bayer;
@@ -151,7 +149,6 @@ impl Stream {
             let (red, blue) = self.debayer.wb;
             info!("White balance: red x{red}/64, blue x{blue}/64");
         }
-        self.debayer.run(&self.bayer, &mut self.bgrx);
         Ok(true)
     }
 }
@@ -172,7 +169,7 @@ fn free_device(device: &str) {
         }
         let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
         let comm = comm.trim();
-        if CRITICAL_PROCESSES.contains(&comm) {
+        if !counts_as_reader(comm) {
             info!("{comm} (pid {pid}) holds {device}: leaving it alone");
         } else {
             warn!("{device} is held by {comm} (pid {pid}): killing it");
@@ -183,6 +180,33 @@ fn free_device(device: &str) {
     if killed {
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Whether a process holding the loopback device open is an application
+/// that wants frames. The desktop's media services keep a permanent
+/// monitoring handle and never count.
+fn counts_as_reader(comm: &str) -> bool {
+    !CRITICAL_PROCESSES.contains(&comm.trim())
+}
+
+/// Whether any other process that counts as a reader holds `target` open.
+fn has_reader(target: &Path) -> bool {
+    let me = std::process::id();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                return false;
+            };
+            pid != me
+                && holds(&entry.path().join("fd"), target)
+                && counts_as_reader(
+                    &fs::read_to_string(entry.path().join("comm")).unwrap_or_default(),
+                )
+        })
 }
 
 /// Whether any fd in a `/proc/<pid>/fd` directory points at `target`.
@@ -204,7 +228,11 @@ fn snapshot(cfg: &Config, path: &str) -> io::Result<()> {
         }
         good += stream.next(cfg)? as u32;
     }
-    let ppm = image::bgrx_to_ppm(&stream.bgrx, cfg.output_width, cfg.output_height);
+    let (w, h) = (cfg.output_width, cfg.output_height);
+    let mut ppm = image::ppm_header(w, h);
+    let head = ppm.len();
+    ppm.resize(head + w * h * 3, 0);
+    stream.debayer.run_rgb(&stream.bayer, &mut ppm[head..]);
     fs::write(path, ppm)?;
     info!("Wrote {path}");
     Ok(())
@@ -220,19 +248,27 @@ fn snapshot(cfg: &Config, path: &str) -> io::Result<()> {
 fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     let (w, h) = (cfg.output_width, cfg.output_height);
     let lb = Loopback::open(cfg)?;
-    let black = image::black_yuyv(w, h);
-    lb.write(&black)?;
+    let mut yuyv = vec![0u8; w * h * 2];
+    image::fill_black_yuyv(&mut yuyv);
+    lb.write(&yuyv)?;
     info!("{} is ready ({w}x{h} YUYV)", cfg.loopback_device);
 
-    let on_demand = on_demand && {
-        let supported = lb.subscribe();
-        if !supported {
-            warn!("this v4l2loopback has no reader events; running the sensor continuously");
-        }
-        supported
-    };
+    let events = on_demand && lb.subscribe();
+    // ponytail: apps that reach the camera through PipeWire are invisible to
+    // the handle scan, upgrade path is a v4l2loopback with reader events.
+    let polling = on_demand && !events;
+    if polling {
+        warn!(
+            "this v4l2loopback has no reader events; detecting readers by open handles \
+             instead. Apps that reach the camera through PipeWire are not detected in this \
+             mode. A newer v4l2loopback adds reader events (see the README)"
+        );
+    }
+    let target = fs::canonicalize(&cfg.loopback_device)
+        .unwrap_or_else(|_| cfg.loopback_device.clone().into());
+    let mut last_poll: Option<Instant> = None;
+    let mut seen_before = false;
     let idle = Duration::from_secs(cfg.idle_secs);
-    let mut yuyv = vec![0u8; w * h * 2];
     let mut gain = cfg.analogue_gain;
     let mut stream: Option<Stream> = None;
     let mut wanted = !on_demand;
@@ -240,7 +276,7 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     let mut retry_at: Option<Instant> = None;
 
     while !stopping() {
-        if on_demand {
+        if events {
             // Sleep on the event while idle, only peek while streaming.
             let timeout_ms = if stream.is_some() { 0 } else { 1000 };
             if let Some(reading) = lb.reader_change(timeout_ms)? {
@@ -248,17 +284,40 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
                 wanted = reading;
                 idle_since = (!reading).then(Instant::now);
             }
+        } else if polling {
+            // The scan is too heavy for every frame: look once a second.
+            if last_poll.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                last_poll = Some(Instant::now());
+                // Two sightings in a row to start: an app listing cameras
+                // opens the device for a moment and should not wake the sensor.
+                let seen = has_reader(&target);
+                let reading = seen && (seen_before || wanted);
+                seen_before = seen;
+                if reading != wanted {
+                    debug!("reader present: {reading}");
+                    wanted = reading;
+                    idle_since = (!reading).then(Instant::now);
+                }
+            }
+            // Idle or waiting to retry: sleep instead of spinning, as the
+            // event wait does.
+            if stream.is_none() && (!wanted || retry_at.is_some_and(|t| Instant::now() < t)) {
+                thread::sleep(Duration::from_secs(1));
+            }
         }
         let expired = !wanted && idle_since.is_none_or(|t| t.elapsed() >= idle);
         match stream.as_mut() {
             Some(s) if !expired => match s.next(cfg) {
                 Ok(true) => {
-                    image::bgrx_to_yuyv(&s.bgrx, &mut yuyv);
+                    s.debayer.run_yuyv(&s.bayer, &mut yuyv);
                     lb.write(&yuyv)?;
                 }
                 // Keep the reader fed while exposure and white balance
                 // settle; browsers give up on a camera that goes silent.
-                Ok(false) if s.calibrating => lb.write(&black)?,
+                Ok(false) if s.calibrating => {
+                    image::fill_black_yuyv(&mut yuyv);
+                    lb.write(&yuyv)?;
+                }
                 Ok(false) => {}
                 // Exiting would close the loopback device and make the
                 // camera vanish from the reader, so stay up and retry.
@@ -273,12 +332,14 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
             Some(s) => {
                 gain = s.gain(cfg);
                 stream = None;
-                lb.write(&black)?;
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
                 info!("No readers left, sensor stopped");
             }
             None if wanted && retry_at.is_none_or(|t| Instant::now() >= t) => {
                 info!("Starting sensor");
-                lb.write(&black)?;
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
                 match Stream::start(cfg, gain) {
                     Ok(s) => {
                         stream = Some(s);
@@ -292,7 +353,10 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
                 }
             }
             // Idle (or waiting to retry): keep the placeholder frame fresh.
-            None => lb.write(&black)?,
+            None => {
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
+            }
         }
     }
     info!("Shutting down");
@@ -309,5 +373,20 @@ pub fn run(cfg: &Config) -> io::Result<()> {
         Mode::Snapshot(path) => snapshot(cfg, path),
         Mode::Loopback => loopback(cfg, false),
         Mode::OnDemand => loopback(cfg, true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_services_never_count_as_readers() {
+        for comm in CRITICAL_PROCESSES {
+            assert!(!counts_as_reader(comm));
+            assert!(!counts_as_reader(&format!("{comm}\n")));
+        }
+        assert!(counts_as_reader("firefox"));
+        assert!(counts_as_reader("pipewire-pulse"));
     }
 }
