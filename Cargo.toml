@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Userspace capture + debayer + v4l2loopback bridge for the OV02C10 sensor behind Intel IPU6"
 license = "MIT"
-repository = "https://github.com/sethbarrett50/ov02c10-camera-fix"
+repository = "https://github.com/SamuelSchwertfeger/ov02c10-camera-fix"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

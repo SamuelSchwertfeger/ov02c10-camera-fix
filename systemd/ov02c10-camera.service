@@ -8,8 +8,8 @@ Documentation=https://github.com/SamuelSchwertfeger/ov02c10-camera-fix
 ExecStart=/usr/bin/ov02c10-camera --on-demand
 Restart=on-failure
 RestartSec=3
-# Safety net: if a regression ever leaks or spins, systemd restarts the
-# service instead of letting it take the machine down.
+# Safety net: a regression that leaks gets the service killed and restarted,
+# one that spins gets throttled, instead of taking the machine down.
 MemoryMax=256M
 CPUQuota=150%
 

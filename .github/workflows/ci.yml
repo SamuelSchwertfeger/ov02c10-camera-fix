@@ -51,7 +51,11 @@ jobs:
       - name: Package
         run: |
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          [ "$GITHUB_REF_TYPE" = tag ] || version="${version}~dev${GITHUB_RUN_NUMBER}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2; exit 1; }
+          else
+            version="${version}~dev${GITHUB_RUN_NUMBER}"
+          fi
           mkdir dist
           cp "target/$TARGET/release/ov02c10-camera" dist/ov02c10-camera-x86_64-linux
           scripts/build-deb.sh dist/ov02c10-camera-x86_64-linux "$version" dist
@@ -67,7 +71,7 @@ jobs:
           sudo apt-get install -y ./dist/ov02c10-camera_amd64.deb
           ov02c10-camera --version
           ov02c10-camera --help
-          ldd /usr/bin/ov02c10-camera 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
+          ! readelf -lW /usr/bin/ov02c10-camera | grep -q INTERP
           if ov02c10-camera --loopback; then
             echo "expected a failure without /dev/video48" >&2
             exit 1

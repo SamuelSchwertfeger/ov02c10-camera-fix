@@ -52,7 +52,8 @@ module.
 #    (check: modinfo v4l2loopback)
 sudo apt install v4l2loopback-dkms
 #    If that fails to build on your kernel, clone this repo and run
-#    ./scripts/setup.sh, which builds a newer version from source.
+#    ./scripts/setup.sh, which builds 0.15.4 from source (the version the
+#    on-demand mode was written against).
 
 # 2. The package (latest build of the dev branch)
 wget https://github.com/SamuelSchwertfeger/ov02c10-camera-fix/releases/download/dev-latest/ov02c10-camera_amd64.deb

@@ -24,9 +24,9 @@ echo "==> Checking v4l2loopback for the running kernel ($(uname -r))..."
 # the setup_timer -> timer_setup API removal) and can fail to build on newer
 # kernels. Build a known-good version from upstream source via DKMS instead,
 # so it still auto-rebuilds on kernel upgrades.
-if dkms status v4l2loopback 2>/dev/null | grep -q "$(uname -r)"; then
+if sudo dkms status v4l2loopback 2>/dev/null | grep -q "$(uname -r)"; then
     echo "    v4l2loopback already built for this kernel, skipping."
-elif modprobe -n v4l2loopback 2>/dev/null; then
+elif /usr/sbin/modprobe -n v4l2loopback 2>/dev/null; then
     echo "    v4l2loopback module already available for this kernel, skipping build."
 else
     sudo apt-get install -y dkms build-essential git "linux-headers-$(uname -r)"
