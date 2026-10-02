@@ -1,16 +1,17 @@
 [Unit]
-Description=OV02C10 IPU6 Camera
-After=graphical-session.target
+Description=OV02C10 IPU6 camera (on-demand virtual webcam)
+Documentation=https://github.com/SamuelSchwertfeger/ov02c10-camera-fix
 
-# No [Install] section / not `systemctl --user enable`d — this service is
-# only ever started/stopped on-demand by ov02c10-camera-watcher.service,
-# based on whether anything actually has /dev/video48 open. Running the
-# camera hardware/GStreamer pipeline continuously from login was wasted
-# CPU/power for a webcam that's used occasionally. See #10.
+# One always-on process. It keeps /dev/video48 visible as a camera at almost
+# no cost and only powers the sensor while an application is streaming.
 [Service]
-Type=simple
-Environment=DISPLAY=:1
-WorkingDirectory=%h/code/ov02c10-camera-fix/camera
-ExecStart=%h/code/ov02c10-camera-fix/camera/.venv/bin/ov02c10-camera --loopback
+ExecStart=/usr/bin/ov02c10-camera --on-demand
 Restart=on-failure
 RestartSec=3
+# Safety net: if a regression ever leaks or spins, systemd restarts the
+# service instead of letting it take the machine down.
+MemoryMax=256M
+CPUQuota=150%
+
+[Install]
+WantedBy=default.target

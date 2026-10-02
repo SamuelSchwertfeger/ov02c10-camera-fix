@@ -5,6 +5,13 @@ same wall on similar hardware (Dell XPS 16, OV02C10 sensor, Intel IPU6
 image processor, mainline/Debian kernel — likely applicable to other
 IPU6-based laptops too).
 
+> These notes were written by Seth Barrett against the original Python
+> implementation (numpy debayer, GStreamer `appsrc`/`v4l2sink`). The tool is
+> now a single Rust binary with no Python, numpy or GStreamer, so the
+> PyGObject/`uv` and GStreamer buffer items below are history. Everything
+> about the hardware (pipeline order, pixel format, CSI2 quirks, gain) still
+> applies and is what the Rust code implements.
+
 ## The three candidate approaches, and why two are dead ends
 
 1. **`libcamera` (via `cam`, `pipewire-libcamera`, etc.)** — sees the
@@ -162,57 +169,51 @@ IPU6-based laptops too).
 
 ## Design decisions
 
-- **On-demand activation is polling-based, not inotify.** #10 asked for
-  the camera to only run while something has `/dev/video48` open, instead
-  of continuously from login. The natural first idea was an inotify watch
-  on the device node for open/close events — but our own service's
-  GStreamer `v4l2sink` also opens `/dev/video48` (as the producer), so a
-  raw inotify event stream can't cleanly distinguish "an external app
-  just opened it" from "the service we just started opened it as the
-  writer" without deeper per-fd tracking. `scripts/camera_watcher.sh`
-  polls `fuser /dev/video48` instead and excludes the service's own
-  `MainPID` (from `systemctl --user show -p MainPID`), which sidesteps
-  that ambiguity entirely at the cost of being bounded by a poll interval
-  (3s) rather than instant.
+- **On-demand activation uses a kernel event, not polling.** #10 asked for
+  the camera to only run while something is using `/dev/video48`. The
+  first version polled `fuser /dev/video48` from a separate watcher
+  service; that could not work with browsers (next section). The current
+  version subscribes to v4l2loopback's `V4L2_EVENT_PRI_CLIENT_USAGE` event
+  on the producer's own file descriptor. The module raises it whenever a
+  reader starts or stops streaming, so there is nothing to poll, no second
+  service, and no need to tell the producer's own open apart from a
+  consumer's. This is the same mechanism Intel's `v4l2-relayd` uses.
+- **One process, no GStreamer.** The process that owns the loopback device
+  also owns the sensor. Frames are converted to YUYV and handed to the
+  loopback device with plain `write()`.
 
-## Known issue: on-demand activation (#10) doesn't work with Chrome/Brave
+## On-demand activation with Chrome/Brave (#10): how it was fixed
 
-`ov02c10-camera-watcher.service` was built to start the real camera
-pipeline only when something actually opens `/dev/video48`, instead of
-running it continuously from login (see Design decisions above). It
-doesn't work for browser use, and isn't fixable by tweaking the watcher —
-it's a structural conflict with how `v4l2loopback`'s `exclusive_caps=1`
-mode works:
+The original watcher design could not work with browsers, because of how
+`v4l2loopback`'s `exclusive_caps=1` mode behaves:
 
-- With `exclusive_caps=1`, the device's reported V4L2 capability is *live*,
-  not persisted: it announces **OUTPUT-only** while no producer is
-  connected, and only switches to announcing **CAPTURE-only** — the mode
-  browsers filter on when enumerating cameras — while a producer is
-  actively holding it open. This is not a format that can be "primed" and
-  left; setting the format once via `v4l2-ctl --set-fmt-video-out` and
-  closing the fd immediately reverts the device to OUTPUT-only, confirmed
-  with `v4l2-ctl -d /dev/video48 --list-formats` returning empty again
-  right after.
-- Chrome/Brave's camera picker only lists devices currently reporting
-  CAPTURE capability, so with nothing producing, the device never appears
-  in the picker at all.
-- The watcher's activation trigger is "an external process has
-  `/dev/video48` open" (via polling `fuser`) — but a browser can't open a
-  device it can't see in its own picker. Nothing can ever trigger the
-  watcher from a cold start; it only works if something else already got
-  the device into CAPTURE mode first.
+- With `exclusive_caps=1`, the device's reported V4L2 capability is *live*:
+  it announces **OUTPUT-only** while no producer is attached, and only
+  announces **CAPTURE** (what browsers filter on when listing cameras)
+  while a producer is streaming into it. In v4l2loopback 0.15 "streaming"
+  means the producer has actually written a frame; setting the output
+  format alone is not enough, and the capability reverts as soon as the
+  producer closes the device.
+- Chrome/Brave only list devices that currently report CAPTURE, so with
+  nothing producing, the camera never appeared in the picker, and nothing
+  could ever open the device to wake the watcher.
 
-Confirmed experimentally: running the pipeline continuously
-(`make run-loopback`, left running) shows up fine in Brave's picker.
-Relying on the watcher alone to start it on first open never shows up.
+The fix is the placeholder producer the original notes suggested, built
+into the tool itself (`ov02c10-camera --on-demand`):
 
-**Current recommendation: don't use the on-demand watcher for browser use.**
-Run `make run-loopback` manually when you need the camera. The
-watcher/service code is left in the repo for reference — a real fix would
-need a always-on, low-cost placeholder producer that keeps the device in
-CAPTURE mode (e.g. a dummy blank-frame writer) and gets swapped for the
-real pipeline on demand, which is meaningfully more complex than the
-current polling design and hasn't been built.
+1. At startup it opens `/dev/video48`, sets the output format and writes
+   one black frame. The device now reports CAPTURE and shows up in every
+   camera picker. The sensor is still off, and so is its LED.
+2. It waits on the client-usage event. While idle it rewrites the black
+   frame about once a second, which costs effectively nothing.
+3. When an application starts streaming, the event fires, the sensor is
+   started, and real frames replace the black one (after a short delay:
+   pipeline setup plus exposure and white-balance calibration).
+4. When the last reader stops, the sensor is shut down after
+   `--idle-secs` (default 5), keeping the last gain for the next start.
+
+If the loaded v4l2loopback is too old to support the event, the tool logs
+a warning and runs the sensor continuously instead.
 
 ## Useful diagnostic commands
 

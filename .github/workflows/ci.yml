@@ -3,53 +3,107 @@ name: CI
 on:
   push:
     branches: [main, dev]
+    tags: ["v*"]
   pull_request:
     branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Static binary: runs on any x86_64 Linux regardless of its glibc version.
+  TARGET: x86_64-unknown-linux-musl
 
 jobs:
-  lint-and-syntax:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Install GStreamer + PyGObject system deps
+      - name: Install toolchains
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-tools \
-            gstreamer1.0-plugins-base v4l-utils
+          rustup toolchain install stable --profile minimal \
+            --component clippy,rustfmt --target "$TARGET"
+          rustup toolchain install 1.85 --profile minimal
+          rustup default stable
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v3
+      - name: Format
+        run: cargo fmt --check
 
-      - name: Install project deps
-        working-directory: camera
-        run: uv sync
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Ruff lint
-        working-directory: camera
-        run: uv run ruff check .
+      - name: Test
+        run: cargo test --locked
 
-      - name: Ruff format check
-        working-directory: camera
-        run: uv run ruff format --check .
+      - name: Minimum supported Rust (Debian 13's rustc)
+        run: cargo +1.85 check --locked
 
-      - name: Byte-compile (syntax check)
-        working-directory: camera
-        run: uv run python -m compileall ov02c10_camera -q
+      - name: Build static release binary
+        run: cargo build --locked --release --target "$TARGET"
 
-      - name: Run tests
-        working-directory: camera
-        run: uv run pytest -q
-
-      # gi/GStreamer come from apt (python3-gi), not the uv venv — PyGObject
-      # needs libgirepository/cairo system libs to build from pip, so this
-      # uses the system python3 directly rather than uv run.
-      - name: GStreamer import check
+      - name: Package
         run: |
-          python3 -c "
-          import gi
-          gi.require_version('Gst', '1.0')
-          from gi.repository import Gst
-          Gst.init(None)
-          print('GStreamer', Gst.version_string(), 'importable OK')
-          "
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          [ "$GITHUB_REF_TYPE" = tag ] || version="${version}~dev${GITHUB_RUN_NUMBER}"
+          mkdir dist
+          cp "target/$TARGET/release/ov02c10-camera" dist/ov02c10-camera-x86_64-linux
+          scripts/build-deb.sh dist/ov02c10-camera-x86_64-linux "$version" dist
+          (cd dist && sha256sum ./* > SHA256SUMS)
+          dpkg-deb --info dist/ov02c10-camera_amd64.deb
+          dpkg-deb --contents dist/ov02c10-camera_amd64.deb
+
+      # There is no camera here, so this only proves the package installs and
+      # the binary starts, is static, and fails cleanly without the hardware.
+      - name: Smoke test the package
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y ./dist/ov02c10-camera_amd64.deb
+          ov02c10-camera --version
+          ov02c10-camera --help
+          ldd /usr/bin/ov02c10-camera 2>&1 | grep -Eq 'statically linked|not a dynamic executable'
+          if ov02c10-camera --loopback; then
+            echo "expected a failure without /dev/video48" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ov02c10-camera
+          path: dist/
+          if-no-files-found: error
+
+  # dev      -> rolling "dev-latest" pre-release, for testing on real hardware
+  # v* tags  -> a normal release
+  release:
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref_type == 'tag')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ov02c10-camera
+          path: dist
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            gh release delete dev-latest --cleanup-tag --yes 2>/dev/null || true
+            gh release create dev-latest dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "Development build" \
+              --notes "Latest build of the dev branch (${GITHUB_SHA::7}). Not hardware-tested; replaced on every push to dev."
+          fi
