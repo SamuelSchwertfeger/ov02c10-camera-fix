@@ -18,12 +18,15 @@ const AE_INTERVAL: u64 = 10;
 const SETTLE_FRAMES: u32 = 4;
 /// Startup calibration gives up converging after this many frames.
 const CALIBRATION_LIMIT: u64 = 60;
-/// Consecutive 2 s frame timeouts before the stream counts as dead.
-const MAX_TIMEOUTS: u32 = 5;
+/// Consecutive missing or short frames before the stream counts as dead.
+const MAX_BAD_FRAMES: u32 = 5;
+/// Wait between attempts when the sensor fails in on-demand mode.
+const RETRY: Duration = Duration::from_secs(3);
 /// Never killed for holding the capture node: WirePlumber keeps a
 /// monitoring handle on camera devices, and killing it takes the whole
 /// desktop's audio routing down with it.
-const CRITICAL_PROCESSES: [&str; 3] = ["pipewire", "wireplumber", "pipewire-media-session"];
+/// Names as they appear in `/proc/<pid>/comm`, which is cut at 15 characters.
+const CRITICAL_PROCESSES: [&str; 3] = ["pipewire", "wireplumber", "pipewire-media-"];
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -49,14 +52,22 @@ struct Stream {
     settle: u32,
     frame_no: u64,
     first_frame: bool,
-    timeouts: u32,
+    bad_frames: u32,
 }
 
 impl Stream {
     fn start(cfg: &Config, analogue_gain: i32) -> io::Result<Self> {
-        free_device(&cfg.capture_device);
         let sensor = Sensor::find(&cfg.media_device)?;
-        let cam = Capture::open(cfg, &sensor, analogue_gain)?;
+        let cam = match Capture::open(cfg, &sensor, analogue_gain) {
+            // Something else is streaming from the capture node, most
+            // likely a stale instance or a stray `cam`.
+            Err(e) if e.kind() == io::ErrorKind::ResourceBusy => {
+                warn!("{e}");
+                free_device(&cfg.capture_device);
+                Capture::open(cfg, &sensor, analogue_gain)?
+            }
+            other => other?,
+        };
         let (w, h) = (cfg.sensor_width, cfg.sensor_height);
         Ok(Self {
             cam,
@@ -71,7 +82,7 @@ impl Stream {
             settle: 0,
             frame_no: 0,
             first_frame: true,
-            timeouts: 0,
+            bad_frames: 0,
         })
     }
 
@@ -85,30 +96,26 @@ impl Stream {
     fn next(&mut self, cfg: &Config) -> io::Result<bool> {
         let (w, h, stride) = (cfg.sensor_width, cfg.sensor_height, self.cam.stride);
         let bayer = &mut self.bayer;
-        match self
+        let got = self
             .cam
-            .frame(|raw| image::unpack_sgrbg10(raw, w, h, stride, bayer))?
-        {
-            Some(true) => self.timeouts = 0,
-            Some(false) => {
-                warn!("short frame from sensor, skipped");
+            .frame(|raw| image::unpack_sgrbg10(raw, w, h, stride, bayer))?;
+        if got != Some(true) {
+            if stopping() {
                 return Ok(false);
             }
-            None => {
-                if stopping() {
-                    return Ok(false);
-                }
-                self.timeouts += 1;
-                warn!(
-                    "timeout waiting for frame ({}/{MAX_TIMEOUTS})",
-                    self.timeouts
-                );
-                if self.timeouts >= MAX_TIMEOUTS {
-                    return Err(io::Error::other("sensor stopped delivering frames"));
-                }
-                return Ok(false);
+            self.bad_frames += 1;
+            let what = if got.is_some() {
+                "short frame"
+            } else {
+                "no frame"
+            };
+            warn!("{what} from sensor ({}/{MAX_BAD_FRAMES})", self.bad_frames);
+            if self.bad_frames >= MAX_BAD_FRAMES {
+                return Err(io::Error::other("sensor stopped delivering frames"));
             }
+            return Ok(false);
         }
+        self.bad_frames = 0;
         // The first frame after stream start is an overexposed warm-up frame.
         if std::mem::take(&mut self.first_frame) {
             return Ok(false);
@@ -230,6 +237,7 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     let mut stream: Option<Stream> = None;
     let mut wanted = !on_demand;
     let mut idle_since: Option<Instant> = None;
+    let mut retry_at: Option<Instant> = None;
 
     while !stopping() {
         if on_demand {
@@ -243,24 +251,47 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
         }
         let expired = !wanted && idle_since.is_none_or(|t| t.elapsed() >= idle);
         match stream.as_mut() {
-            Some(s) if !expired => {
-                if s.next(cfg)? {
+            Some(s) if !expired => match s.next(cfg) {
+                Ok(true) => {
                     image::bgrx_to_yuyv(&s.bgrx, &mut yuyv);
                     lb.write(&yuyv)?;
                 }
-            }
+                // Keep the reader fed while exposure and white balance
+                // settle; browsers give up on a camera that goes silent.
+                Ok(false) if s.calibrating => lb.write(&black)?,
+                Ok(false) => {}
+                // Exiting would close the loopback device and make the
+                // camera vanish from the reader, so stay up and retry.
+                Err(e) if on_demand => {
+                    warn!("sensor failed, retrying in {}s: {e}", RETRY.as_secs());
+                    gain = s.gain(cfg);
+                    stream = None;
+                    retry_at = Some(Instant::now() + RETRY);
+                }
+                Err(e) => return Err(e),
+            },
             Some(s) => {
                 gain = s.gain(cfg);
                 stream = None;
                 lb.write(&black)?;
                 info!("No readers left, sensor stopped");
             }
-            None if wanted => {
+            None if wanted && retry_at.is_none_or(|t| Instant::now() >= t) => {
                 info!("Starting sensor");
-                stream = Some(Stream::start(cfg, gain)?);
+                lb.write(&black)?;
+                match Stream::start(cfg, gain) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        retry_at = None;
+                    }
+                    Err(e) if on_demand => {
+                        warn!("sensor start failed, retrying in {}s: {e}", RETRY.as_secs());
+                        retry_at = Some(Instant::now() + RETRY);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            // Idle: keep a frame flowing so a reader that just attached is
-            // not left waiting while the sensor starts.
+            // Idle (or waiting to retry): keep the placeholder frame fresh.
             None => lb.write(&black)?,
         }
     }
