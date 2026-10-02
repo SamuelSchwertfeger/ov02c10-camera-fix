@@ -38,14 +38,13 @@ fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
 }
 
-/// A running sensor stream that turns raw frames into BGRx.
+/// A running sensor stream that turns raw frames into calibrated Bayer.
 struct Stream {
     cam: Capture,
     sensor: Sensor,
     ae: Option<AutoExposure>,
     debayer: Debayer,
     bayer: Vec<u8>,
-    bgrx: Vec<u8>,
     /// Until exposure has converged and white balance is measured, frames
     /// are held back.
     calibrating: bool,
@@ -77,7 +76,6 @@ impl Stream {
                 .then(|| AutoExposure::new(analogue_gain, cfg.ae_target)),
             debayer: Debayer::new(w, h, cfg.output_width, cfg.output_height),
             bayer: vec![0; w * h],
-            bgrx: vec![0; cfg.output_width * cfg.output_height * 4],
             calibrating: true,
             settle: 0,
             frame_no: 0,
@@ -92,7 +90,7 @@ impl Stream {
         self.ae.as_ref().map_or(cfg.analogue_gain, |ae| ae.gain)
     }
 
-    /// Process one sensor frame. True when `self.bgrx` holds a new image.
+    /// Process one sensor frame. True when `self.bayer` holds a new calibrated frame.
     fn next(&mut self, cfg: &Config) -> io::Result<bool> {
         let (w, h, stride) = (cfg.sensor_width, cfg.sensor_height, self.cam.stride);
         let bayer = &mut self.bayer;
@@ -151,7 +149,6 @@ impl Stream {
             let (red, blue) = self.debayer.wb;
             info!("White balance: red x{red}/64, blue x{blue}/64");
         }
-        self.debayer.run(&self.bayer, &mut self.bgrx);
         Ok(true)
     }
 }
@@ -204,7 +201,11 @@ fn snapshot(cfg: &Config, path: &str) -> io::Result<()> {
         }
         good += stream.next(cfg)? as u32;
     }
-    let ppm = image::bgrx_to_ppm(&stream.bgrx, cfg.output_width, cfg.output_height);
+    let (w, h) = (cfg.output_width, cfg.output_height);
+    let mut ppm = image::ppm_header(w, h);
+    let head = ppm.len();
+    ppm.resize(head + w * h * 3, 0);
+    stream.debayer.run_rgb(&stream.bayer, &mut ppm[head..]);
     fs::write(path, ppm)?;
     info!("Wrote {path}");
     Ok(())
@@ -220,8 +221,9 @@ fn snapshot(cfg: &Config, path: &str) -> io::Result<()> {
 fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     let (w, h) = (cfg.output_width, cfg.output_height);
     let lb = Loopback::open(cfg)?;
-    let black = image::black_yuyv(w, h);
-    lb.write(&black)?;
+    let mut yuyv = vec![0u8; w * h * 2];
+    image::fill_black_yuyv(&mut yuyv);
+    lb.write(&yuyv)?;
     info!("{} is ready ({w}x{h} YUYV)", cfg.loopback_device);
 
     let on_demand = on_demand && {
@@ -232,7 +234,6 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
         supported
     };
     let idle = Duration::from_secs(cfg.idle_secs);
-    let mut yuyv = vec![0u8; w * h * 2];
     let mut gain = cfg.analogue_gain;
     let mut stream: Option<Stream> = None;
     let mut wanted = !on_demand;
@@ -253,12 +254,15 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
         match stream.as_mut() {
             Some(s) if !expired => match s.next(cfg) {
                 Ok(true) => {
-                    image::bgrx_to_yuyv(&s.bgrx, &mut yuyv);
+                    s.debayer.run_yuyv(&s.bayer, &mut yuyv);
                     lb.write(&yuyv)?;
                 }
                 // Keep the reader fed while exposure and white balance
                 // settle; browsers give up on a camera that goes silent.
-                Ok(false) if s.calibrating => lb.write(&black)?,
+                Ok(false) if s.calibrating => {
+                    image::fill_black_yuyv(&mut yuyv);
+                    lb.write(&yuyv)?;
+                }
                 Ok(false) => {}
                 // Exiting would close the loopback device and make the
                 // camera vanish from the reader, so stay up and retry.
@@ -273,12 +277,14 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
             Some(s) => {
                 gain = s.gain(cfg);
                 stream = None;
-                lb.write(&black)?;
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
                 info!("No readers left, sensor stopped");
             }
             None if wanted && retry_at.is_none_or(|t| Instant::now() >= t) => {
                 info!("Starting sensor");
-                lb.write(&black)?;
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
                 match Stream::start(cfg, gain) {
                     Ok(s) => {
                         stream = Some(s);
@@ -292,7 +298,10 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
                 }
             }
             // Idle (or waiting to retry): keep the placeholder frame fresh.
-            None => lb.write(&black)?,
+            None => {
+                image::fill_black_yuyv(&mut yuyv);
+                lb.write(&yuyv)?;
+            }
         }
     }
     info!("Shutting down");
