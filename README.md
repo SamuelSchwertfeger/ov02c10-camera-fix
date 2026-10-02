@@ -5,140 +5,141 @@ Working camera capture for laptops with an **OV02C10** sensor behind an
 systems, where neither `libcamera` nor Intel's proprietary camera HAL
 produce a usable image out of the box.
 
-Feeds a corrected image into a [v4l2loopback](https://github.com/umlaeute/v4l2loopback)
+Feeds a corrected image into a [v4l2loopback](https://github.com/v4l2loopback/v4l2loopback)
 virtual camera device, so it shows up as a normal webcam in Brave, Chrome,
 Teams, Zoom, Discord, etc.
+
+This is a Rust rewrite of [Seth Barrett's original Python
+implementation](https://github.com/sethbarrett50/ov02c10-camera-fix). The
+hardware investigation and the capture recipe are his; see
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+
+## What changed in the rewrite
+
+- **One static binary**, no Python, numpy or GStreamer. The
+  only runtime dependency is `v4l-utils` (`media-ctl`, `v4l2-ctl`).
+- **On-demand activation works with Chrome/Brave.** The sensor (and its
+  LED) is only on while an application is using the camera, and the camera
+  still shows up in the browser's picker while idle. One systemd unit
+  instead of a service plus a polling watcher.
+- **Continuous auto-exposure.** Analogue gain follows the room lighting
+  while streaming, not only at startup.
+- **A `.deb`** built by CI for every change.
+
+Not carried over: the preview window. Use `--snapshot FILE` for a quick
+look at what the sensor sees, or open the camera in any application.
 
 ## Why this exists
 
 - `libcamera`'s software fallback IPA (`uncalibrated.yaml`) captures a
-  valid first frame, then every frame after it comes out solid black —
-  no real auto-gain control for this sensor.
-- Intel's proprietary HAL (`icamerasrc`/`libcamhal`), even if installed
-  with real tuning data for this exact sensor, fails with
-  `Failed to open PSYS` — the IPU6's hardware ISP driver isn't in
-  mainline/Debian kernels, only Ubuntu's OEM-patched kernel or an
-  out-of-tree DKMS module.
+  valid first frame, then every frame after it comes out solid black.
+- Intel's proprietary HAL (`icamerasrc`/`libcamhal`) fails with
+  `Failed to open PSYS`: the IPU6's hardware ISP driver isn't in
+  mainline/Debian kernels.
 
-See [`docs/DEBUGGING.md`](docs/DEBUGGING.md) for the full investigation,
-including diagnostic commands for confirming you're hitting the same
-issues on your own hardware.
+This tool instead captures raw Bayer frames directly via V4L2, debayers,
+white-balances and exposes them in software, and writes the result to a
+v4l2loopback device.
 
-This repo instead captures raw frames directly via V4L2, debayers and
-gain-corrects them in software (numpy), and streams the result into a
-v4l2loopback device via GStreamer — no dependency on either broken path.
+## Install
 
-**Known limitation:** there's no real auto-exposure loop. Gain is a fixed,
-tuned value (see `--analogue-gain`/`--digital-gain`) — good enough for a
-webcam in a stable-lighting environment, not a general fix for varying
-light. See [open issues](../../issues) for planned improvements.
-
-## Requirements
-
-- OV02C10 sensor behind Intel IPU6 (`intel_ipu6` + `intel_ipu6_isys`
-  kernel modules loaded — check with `lsmod | grep ipu6`)
-- `v4l2loopback-dkms` (for the virtual camera device)
-- `gstreamer1.0-tools`, `gstreamer1.0-plugins-base`,
-  `python3-gi`, `gir1.2-gstreamer-1.0` (GStreamer + Python bindings —
-  installed from your distro's package manager, not pip)
-- `v4l-utils` (`media-ctl`, `v4l2-ctl`)
-- [`uv`](https://docs.astral.sh/uv/) for Python dependency management
-
-All of the above (except the kernel modules — see below) are installed
-automatically by `make setup` / `scripts/setup.sh`.
-
-## Setup
+Requirements: the OV02C10 sensor behind Intel IPU6 (`lsmod | grep ipu6`
+shows `intel_ipu6` and `intel_ipu6_isys`), and the `v4l2loopback` kernel
+module.
 
 ```bash
-# 1. One-shot bootstrap: apt packages, v4l2loopback device, uv, Python deps
-make setup
+# 1. The v4l2loopback kernel module, if you don't have it yet
+#    (check: modinfo v4l2loopback)
+sudo apt install v4l2loopback-dkms
+#    If that fails to build on your kernel, clone this repo and run
+#    ./scripts/setup.sh, which builds a newer version from source.
 
-# 2. Confirm the sensor's current media entity name (bus number can change per boot)
-media-ctl -d /dev/media0 -p | grep -i ov02c10
+# 2. The package (latest build of the dev branch)
+wget https://github.com/SamuelSchwertfeger/ov02c10-camera-fix/releases/download/dev-latest/ov02c10-camera_amd64.deb
+sudo apt install ./ov02c10-camera_amd64.deb
 
-# 3. Test run in the foreground first (opens a preview window)
-make run
-
-# 4. For browser/Teams/Zoom use, feed the loopback device in the foreground
-make run-loopback
+# 3. Start it now and at every login
+systemctl --user enable --now ov02c10-camera
 ```
 
-`make run-loopback` is currently the supported way to use this as a
-webcam — leave it running in a terminal while you're on a call. There is
-also an on-demand systemd setup (`make install`, below) that tries to
-start/stop the pipeline automatically, but it **doesn't work with
-Chrome/Brave** — see the "Known issue" section in
-[`docs/DEBUGGING.md`](docs/DEBUGGING.md) for why.
+Open a camera test page or a call: "OV02C10 Camera" appears in the picker,
+and the sensor starts when the application starts using it.
 
-`make setup` needs `sudo` for package installation and loading the
-`v4l2loopback` kernel module — it will prompt. It's idempotent, safe to
-re-run.
+The package installs the binary, the systemd `--user` unit, a udev rule
+giving the logged-in user access to the camera nodes, and a modprobe
+configuration that loads `v4l2loopback` at boot as `/dev/video48`.
+Tagged releases are on the [releases page](../../releases).
 
-`make install` copies `camera/` to `~/code/ov02c10-camera-fix/camera`,
-syncs deps there, and installs two systemd `--user` units + a resource-cap
-override from `systemd/`:
+Things to know:
 
-- `ov02c10-camera-watcher.service` — a lightweight always-on watcher
-  (enabled to start at login) that polls whether anything actually has
-  `/dev/video48` open (Brave, Zoom, Discord, ...)
-- `ov02c10-camera.service` — the actual camera/GStreamer pipeline, started
-  and stopped on-demand *by the watcher*, not enabled for auto-start
-  itself. Running the camera hardware continuously from login was wasted
-  CPU/power for a webcam that's only used occasionally.
+- If `v4l2loopback` was already loaded with other options, reload it so
+  `/dev/video48` exists: `sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback`.
+- If you previously ran the Python version's `make install`, remove its
+  units first, since they take precedence over the packaged one:
+  ```bash
+  systemctl --user disable --now ov02c10-camera-watcher ov02c10-camera
+  rm -rf ~/.config/systemd/user/ov02c10-camera*
+  systemctl --user daemon-reload
+  ```
 
-So after `make install`, nothing shows video until an app actually opens
-the loopback device — the camera light/pipeline turns on within a few
-seconds of opening Brave's camera picker (or similar) and turns off a few
-seconds after the last consumer closes it. `make logs`/`make logs-watcher`
-tail each service's journal if you want to watch this happen.
+### From source
 
-**This doesn't currently work for browser cameras** (Chrome/Brave never
-lists the device in the first place, so nothing ever triggers the
-watcher) — see [`docs/DEBUGGING.md`](docs/DEBUGGING.md). Use
-`make run-loopback` instead for now.
+```bash
+make setup     # v4l-utils, cargo, v4l2loopback (needs sudo)
+make install   # build, package, install, start the service
+```
 
-The `override.conf` caps the camera service at 1GB RAM / 1.5 CPU cores as
-a safety net — if a future regression leaks resources again, systemd
-kills and restarts it instead of it taking down your machine.
+Needs Rust 1.85 or newer (Debian 13's `cargo` is enough).
 
-Run `make help` to see every available command (`make test`, `make logs`,
-`make gain`, `make lint`, etc.).
+## Usage
+
+```
+ov02c10-camera --on-demand      # what the service runs
+ov02c10-camera --loopback       # sensor always on
+ov02c10-camera --snapshot f.ppm # one frame to a file, then exit
+ov02c10-camera --help           # all options
+```
+
+`make logs` tails the service's journal; add `-v` to a foreground run for
+every `media-ctl`/`v4l2-ctl` call.
+
+When started, the tool kills other processes holding the raw capture node
+(`/dev/video32`), such as a stale instance or a stray `cam`. PipeWire and
+WirePlumber are left alone.
+
+## Tuning
+
+Auto-exposure adjusts the sensor's analogue gain (16 to 248) to keep the
+average brightness near `--ae-target` (default 128), and backs off when
+highlights clip. White balance is measured once per sensor start.
+
+```bash
+make gain                                              # current sensor controls
+ov02c10-camera --loopback --ae-target 110              # darker image
+ov02c10-camera --loopback --no-auto-exposure --analogue-gain 100
+```
+
+To change the service's options, `systemctl --user edit ov02c10-camera`
+and override `ExecStart`.
 
 ## Development
 
 ```
-camera/
-  pyproject.toml
-  ov02c10_camera/
-    cli.py             # argument parsing, entry point
-    config.py          # CameraConfig dataclass
-    logging_setup.py   # logging configuration
-    media_pipeline.py  # media-ctl/v4l2-ctl wiring (sensor discovery, gain, links)
-    camera.py          # V4L2Camera: mmap capture + debayer
-    gst_pipeline.py     # GStreamer sink wiring (preview window or v4l2loopback)
-  tests/                # pytest — debayer math, pgAA unpacking, media-ctl parsing
+src/
+  main.rs      entry point, logging
+  config.rs    command line
+  image.rs     unpack, statistics, white balance, debayer, YUYV
+  exposure.rs  auto-exposure
+  media.rs     media-ctl / v4l2-ctl wiring (sensor discovery, gain, links)
+  v4l2.rs      V4L2 structs and ioctls, capture and loopback devices
+  run.rs       run modes, stream loop
 ```
 
-`make test` runs the test suite (`camera/tests/`), which covers the
-hardware-independent logic (debayer math, pgAA unpacking, sensor-entity
-regex parsing against mocked `media-ctl` output) — it can't exercise the
-actual V4L2/GStreamer hardware path, which only real hardware can test.
-See [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Tuning for your environment
-
-Gain values in `CameraConfig` (`analogue_gain=150`, `digital_gain=4096`)
-were tuned for one indoor room and are not adaptive. If your image is too
-dark or too bright, check current sensor state and retune:
-
-```bash
-make gain   # prints current exposure/gain control values
-cd camera && uv run ov02c10-camera --analogue-gain 100 --digital-gain 2048   # example
-```
-
-See [`docs/DEBUGGING.md`](docs/DEBUGGING.md) for how the defaults were
-picked.
+`make check` and `make test` are what CI runs. The tests cover the
+hardware-independent logic (image math, auto-exposure, argument and
+`media-ctl` parsing, ioctl numbers); the V4L2 path can only be tested on
+real hardware. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). Original work copyright Seth Barrett.
