@@ -4,12 +4,18 @@ Documentation=https://github.com/SamuelSchwertfeger/ov02c10-camera-fix
 
 # One always-on process. It keeps /dev/video48 visible as a camera at almost
 # no cost and only powers the sensor while an application is streaming.
+# Keep retrying forever if the camera or /dev/video48 is not ready at login.
+StartLimitIntervalSec=0
+# Only for real logins: a second instance under the display manager's or
+# root's user manager would fight this one for the camera.
+ConditionUser=!@system
+
 [Service]
 ExecStart=/usr/bin/ov02c10-camera --on-demand
-Restart=on-failure
+Restart=always
 RestartSec=3
-# Safety net: if a regression ever leaks or spins, systemd restarts the
-# service instead of letting it take the machine down.
+# Safety net: a regression that leaks gets the service killed and restarted,
+# one that spins gets throttled, instead of taking the machine down.
 MemoryMax=256M
 CPUQuota=150%
 

@@ -1,4 +1,4 @@
-//! Pure pixel work: raw unpacking, debayer, white balance, colour conversion.
+//! Pure pixel work: raw unpacking, demosaic, white balance, colour conversion.
 //! Nothing here touches hardware, so all of it is unit-testable anywhere.
 
 /// Raw values at or above this (of 255) count as clipped.
@@ -94,97 +94,234 @@ pub fn white_balance(bayer: &[u8], width: usize, height: usize) -> (u16, u16) {
     (gain(r_mean), gain(b_mean))
 }
 
-/// GRBG debayer straight to output resolution.
+/// Sensor coordinate of one output column or row, plus its two neighbours
+/// with the border mirrored so colour parity is preserved.
+#[derive(Clone, Copy)]
+struct Axis {
+    c: usize,
+    lo: usize,
+    hi: usize,
+}
+
+/// One bayer row and the rows above and below it, and whether it is odd.
+type Rows<'a> = (&'a [u8], &'a [u8], &'a [u8], bool);
+
+/// Bilinear GRBG demosaic, one output pixel per sensor pixel, with white
+/// balance, written straight to YUYV or RGB.
 ///
-/// Each 2x2 quad (G at (0,0) and (1,1), R at (0,1), B at (1,0)) becomes one
-/// half-resolution pixel; output pixels pick their quad by nearest neighbour.
-// ponytail: box filter + nearest neighbour gives half the sensor's detail.
-// Swap in a bilinear demosaic here if sharpness ever matters.
+/// The source is a centred crop of the sensor: exact 1:1 when the output is
+/// at most 16 px smaller than the sensor, otherwise the largest centred
+/// region with the output's aspect ratio, sampled by nearest neighbour.
+// ponytail: nearest-neighbour downscaling aliases, an area filter is the upgrade.
 pub struct Debayer {
     width: usize,
-    out_width: usize,
-    out_height: usize,
-    x_idx: Vec<usize>,
-    y_idx: Vec<usize>,
+    cols: Vec<Axis>,
+    rows: Vec<Axis>,
+    /// First sensor column of a 1:1 crop that never touches the left or
+    /// right border, which lets `run_yuyv` take its fast path.
+    crop_x: Option<usize>,
     /// Red and blue white-balance gains, /64 fixed point.
     pub wb: (u16, u16),
+}
+
+fn avg2(a: u8, b: u8) -> u32 {
+    (a as u32 + b as u32 + 1) >> 1
+}
+
+fn avg4(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32 + b as u32 + c as u32 + d as u32 + 2) >> 2
+}
+
+/// Pack two horizontally adjacent RGB pixels as one YUYV group.
+#[inline(always)]
+fn put_yuyv(dst: &mut [u8], p0: [i32; 3], p1: [i32; 3]) {
+    let luma = |[r, g, b]: [i32; 3]| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+    let (r, g, b) = (
+        (p0[0] + p1[0]) / 2,
+        (p0[1] + p1[1]) / 2,
+        (p0[2] + p1[2]) / 2,
+    );
+    dst[0] = luma(p0);
+    dst[1] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+    dst[2] = luma(p1);
+    dst[3] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
 }
 
 impl Debayer {
     /// `width`/`height` are the sensor's, and must both be at least 2.
     pub fn new(width: usize, height: usize, out_width: usize, out_height: usize) -> Self {
-        // Evenly spaced sensor coordinate for each output pixel, mapped to its quad.
-        let index = |len: usize, out: usize| -> Vec<usize> {
-            let quads = len / 2;
+        let (rw, rh, x0, y0) = if out_width <= width
+            && out_height <= height
+            && width - out_width <= 16
+            && height - out_height <= 16
+        {
+            (
+                out_width,
+                out_height,
+                (width - out_width) / 2,
+                (height - out_height) / 2,
+            )
+        } else {
+            let (rw, rh) = if width * out_height >= height * out_width {
+                ((height * out_width / out_height).clamp(1, width), height)
+            } else {
+                (width, (width * out_height / out_width).clamp(1, height))
+            };
+            (rw, rh, (width - rw) / 2, (height - rh) / 2)
+        };
+        // Centre of each output pixel's footprint, mapped into the region.
+        let axis = |len: usize, region: usize, start: usize, out: usize| -> Vec<Axis> {
             (0..out)
                 .map(|i| {
-                    let pos = if out > 1 {
-                        i * (len - 1) / (out - 1)
-                    } else {
-                        0
-                    };
-                    (pos / 2).min(quads - 1)
+                    let c = start + (2 * i + 1) * region / (2 * out);
+                    Axis {
+                        c,
+                        lo: if c == 0 { 1 } else { c - 1 },
+                        hi: if c + 1 == len { len - 2 } else { c + 1 },
+                    }
                 })
                 .collect()
         };
+        let fast = rw == out_width && x0 >= 1 && x0 + out_width < width && out_width % 2 == 0;
         Self {
             width,
-            out_width,
-            out_height,
-            x_idx: index(width, out_width),
-            y_idx: index(height, out_height),
+            crop_x: fast.then_some(x0),
+            cols: axis(width, rw, x0, out_width),
+            rows: axis(height, rh, y0, out_height),
             wb: (WB_UNITY, WB_UNITY),
         }
     }
 
-    /// Fill `out` (out_width * out_height * 4 bytes) with BGRx pixels.
-    pub fn run(&self, bayer: &[u8], out: &mut [u8]) {
-        let (sr, sb) = (self.wb.0 as u32, self.wb.1 as u32);
-        let rows = out.chunks_exact_mut(self.out_width * 4);
-        for (row, &qy) in rows.take(self.out_height).zip(&self.y_idx) {
-            let top = &bayer[2 * qy * self.width..];
-            let bot = &bayer[(2 * qy + 1) * self.width..];
-            for (px, &qx) in row.chunks_exact_mut(4).zip(&self.x_idx) {
-                let g = (top[2 * qx] as u32 + bot[2 * qx + 1] as u32) / 2;
-                let r = (top[2 * qx + 1] as u32 * sr) >> 6;
-                let b = (bot[2 * qx] as u32 * sb) >> 6;
-                px[0] = b.min(255) as u8;
-                px[1] = g as u8;
-                px[2] = r.min(255) as u8;
-                px[3] = 0;
+    fn rows_of<'a>(&self, bayer: &'a [u8], ay: &Axis) -> Rows<'a> {
+        let w = self.width;
+        let row = |y: usize| &bayer[y * w..(y + 1) * w];
+        (row(ay.lo), row(ay.c), row(ay.hi), ay.c & 1 == 1)
+    }
+
+    /// White-balanced (r, g, b) of the centre of a 3x3 neighbourhood, each
+    /// row given as [left, centre, right]. The parities are constants at
+    /// every call on the fast path, so the match folds away there.
+    #[inline(always)]
+    fn rgb(
+        &self,
+        odd_row: bool,
+        odd_col: bool,
+        up: [u8; 3],
+        cur: [u8; 3],
+        dn: [u8; 3],
+    ) -> [i32; 3] {
+        let (red, green, blue) = match (odd_row, odd_col) {
+            (false, false) => (avg2(cur[0], cur[2]), cur[1] as u32, avg2(up[1], dn[1])),
+            (true, true) => (avg2(up[1], dn[1]), cur[1] as u32, avg2(cur[0], cur[2])),
+            (false, true) => (
+                cur[1] as u32,
+                avg4(cur[0], cur[2], up[1], dn[1]),
+                avg4(up[0], up[2], dn[0], dn[2]),
+            ),
+            (true, false) => (
+                avg4(up[0], up[2], dn[0], dn[2]),
+                avg4(cur[0], cur[2], up[1], dn[1]),
+                cur[1] as u32,
+            ),
+        };
+        let red = (red * self.wb.0 as u32) >> 6;
+        let blue = (blue * self.wb.1 as u32) >> 6;
+        [red.min(255) as i32, green as i32, blue.min(255) as i32]
+    }
+
+    /// White-balanced (r, g, b) at one output column.
+    fn pixel(&self, (up, cur, dn, odd_row): Rows, a: &Axis) -> [i32; 3] {
+        let (x, l, r) = (a.c, a.lo, a.hi);
+        self.rgb(
+            odd_row,
+            x & 1 == 1,
+            [up[l], up[x], up[r]],
+            [cur[l], cur[x], cur[r]],
+            [dn[l], dn[x], dn[r]],
+        )
+    }
+
+    /// One output row of a 1:1 crop. The row slices start one sensor pixel
+    /// left of the first output pixel and end one right of the last.
+    #[inline(always)]
+    fn crop_row(&self, odd_row: bool, odd_col: bool, src: [&[u8]; 3], dst: &mut [u8]) {
+        let quads = src[0]
+            .windows(4)
+            .step_by(2)
+            .zip(src[1].windows(4).step_by(2))
+            .zip(src[2].windows(4).step_by(2));
+        for (d, ((u, c), n)) in dst.chunks_exact_mut(4).zip(quads) {
+            let p0 = self.rgb(
+                odd_row,
+                odd_col,
+                [u[0], u[1], u[2]],
+                [c[0], c[1], c[2]],
+                [n[0], n[1], n[2]],
+            );
+            let p1 = self.rgb(
+                odd_row,
+                !odd_col,
+                [u[1], u[2], u[3]],
+                [c[1], c[2], c[3]],
+                [n[1], n[2], n[3]],
+            );
+            put_yuyv(d, p0, p1);
+        }
+    }
+
+    /// Fill `out` (out_width * out_height * 2 bytes) with YUYV (YUY2), BT.601
+    /// limited range. Chroma is averaged over each horizontal pixel pair, so
+    /// the output width must be even.
+    pub fn run_yuyv(&self, bayer: &[u8], out: &mut [u8]) {
+        let stride = self.cols.len() * 2;
+        let rows = out.chunks_exact_mut(stride).zip(&self.rows);
+        if let Some(x0) = self.crop_x {
+            let span = x0 - 1..x0 + self.cols.len() + 1;
+            for (row, ay) in rows {
+                let (up, cur, dn, odd_row) = self.rows_of(bayer, ay);
+                let src = [&up[span.clone()], &cur[span.clone()], &dn[span.clone()]];
+                // Spelled out so each parity gets its own branch-free loop.
+                match (odd_row, x0 & 1 == 1) {
+                    (false, false) => self.crop_row(false, false, src, row),
+                    (false, true) => self.crop_row(false, true, src, row),
+                    (true, false) => self.crop_row(true, false, src, row),
+                    (true, true) => self.crop_row(true, true, src, row),
+                }
+            }
+            return;
+        }
+        for (row, ay) in rows {
+            let src = self.rows_of(bayer, ay);
+            for (dst, pair) in row.chunks_exact_mut(4).zip(self.cols.chunks_exact(2)) {
+                put_yuyv(dst, self.pixel(src, &pair[0]), self.pixel(src, &pair[1]));
+            }
+        }
+    }
+
+    /// Fill `out` (out_width * out_height * 3 bytes) with RGB pixels.
+    pub fn run_rgb(&self, bayer: &[u8], out: &mut [u8]) {
+        let stride = self.cols.len() * 3;
+        for (row, ay) in out.chunks_exact_mut(stride).zip(&self.rows) {
+            let src = self.rows_of(bayer, ay);
+            for (dst, a) in row.chunks_exact_mut(3).zip(&self.cols) {
+                let p = self.pixel(src, a);
+                dst.copy_from_slice(&[p[0] as u8, p[1] as u8, p[2] as u8]);
             }
         }
     }
 }
 
-/// BGRx to YUYV (YUY2), BT.601 limited range. Chroma is averaged over each
-/// horizontal pixel pair, so the frame width must be even.
-pub fn bgrx_to_yuyv(bgrx: &[u8], yuyv: &mut [u8]) {
-    let luma = |r: i32, g: i32, b: i32| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
-    for (src, dst) in bgrx.chunks_exact(8).zip(yuyv.chunks_exact_mut(4)) {
-        let (b0, g0, r0) = (src[0] as i32, src[1] as i32, src[2] as i32);
-        let (b1, g1, r1) = (src[4] as i32, src[5] as i32, src[6] as i32);
-        let (r, g, b) = ((r0 + r1) / 2, (g0 + g1) / 2, (b0 + b1) / 2);
-        dst[0] = luma(r0, g0, b0);
-        dst[1] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-        dst[2] = luma(r1, g1, b1);
-        dst[3] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+/// Fill a YUYV frame with black (Y=16, U=V=128), the placeholder while the
+/// sensor is off.
+pub fn fill_black_yuyv(yuyv: &mut [u8]) {
+    for px in yuyv.chunks_exact_mut(4) {
+        px.copy_from_slice(&[16, 128, 16, 128]);
     }
 }
 
-/// A black YUYV frame, used as the placeholder while the sensor is off.
-pub fn black_yuyv(width: usize, height: usize) -> Vec<u8> {
-    [16u8, 128, 16, 128].repeat(width * height / 2)
-}
-
-/// Encode a BGRx frame as a binary PPM (P6).
-pub fn bgrx_to_ppm(bgrx: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
-    out.reserve(width * height * 3);
-    for px in bgrx.chunks_exact(4).take(width * height) {
-        out.extend_from_slice(&[px[2], px[1], px[0]]);
-    }
-    out
+/// Header of a binary PPM (P6); the RGB bytes follow.
+pub fn ppm_header(width: usize, height: usize) -> Vec<u8> {
+    format!("P6\n{width} {height}\n255\n").into_bytes()
 }
 
 #[cfg(test)]
@@ -206,8 +343,55 @@ mod tests {
         v
     }
 
+    #[test]
+    fn crop_fast_path_matches_general_path() {
+        // Even and odd crop offsets, so all four parity kernels run.
+        for (w, h) in [(40, 30), (38, 28)] {
+            let mut seed = 12345u32;
+            let bayer: Vec<u8> = (0..w * h)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let mut d = Debayer::new(w, h, 32, 22);
+            d.wb = (90, 110);
+            assert!(d.crop_x.is_some());
+            let mut fast = vec![0u8; 32 * 22 * 2];
+            d.run_yuyv(&bayer, &mut fast);
+            d.crop_x = None;
+            let mut general = vec![0u8; 32 * 22 * 2];
+            d.run_yuyv(&bayer, &mut general);
+            assert_eq!(fast, general);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing only: cargo test --release -- --ignored --nocapture"]
+    fn bench_1080p() {
+        let bayer = vec![100u8; 1928 * 1092];
+        let mut out = vec![0u8; 1920 * 1080 * 2];
+        let mut d = Debayer::new(1928, 1092, 1920, 1080);
+        for fast in [true, false] {
+            if !fast {
+                d.crop_x = None;
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                d.run_yuyv(std::hint::black_box(&bayer), &mut out);
+            }
+            println!("fast={fast}: {:?}/frame", t.elapsed() / 50);
+        }
+    }
+
     fn le_bytes(vals: &[u16]) -> Vec<u8> {
         vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn rgb_of(d: &Debayer, bayer: &[u8], n: usize) -> Vec<u8> {
+        let mut out = vec![9u8; n * 3];
+        d.run_rgb(bayer, &mut out);
+        out
     }
 
     #[test]
@@ -297,72 +481,91 @@ mod tests {
     }
 
     #[test]
-    fn debayer_is_identity_at_unity_gain() {
+    fn solid_colour_is_uniform_including_borders() {
         let (w, h) = (16, 8);
         let bayer = solid_bayer(w, h, 60, 200, 20);
         let d = Debayer::new(w, h, w, h);
         assert_eq!(d.wb, (WB_UNITY, WB_UNITY));
-        let mut out = vec![9u8; w * h * 4];
-        d.run(&bayer, &mut out);
-        for px in out.chunks_exact(4) {
-            assert_eq!(px, [20, 200, 60, 0]);
+        let want = [60u8, 200u8, 20u8];
+        for px in rgb_of(&d, &bayer, w * h).chunks_exact(3) {
+            assert_eq!(px, want);
         }
     }
 
     #[test]
-    fn debayer_output_matches_configured_resolution() {
-        let (w, h) = (1928, 1092);
-        let bayer = solid_bayer(w, h, 10, 10, 10);
-        let d = Debayer::new(w, h, 320, 240);
-        let mut out = vec![0u8; 320 * 240 * 4];
-        d.run(&bayer, &mut out);
-        assert!(out.chunks_exact(4).all(|p| p == [10, 10, 10, 0]));
+    fn exact_crop_for_sensor_padding() {
+        let d = Debayer::new(1928, 1092, 1920, 1080);
+        assert_eq!((d.cols[0].c, d.rows[0].c), (4, 6));
+        assert_eq!((d.cols[1919].c, d.rows[1079].c), (1923, 1085));
+        assert!(d.cols.windows(2).all(|p| p[1].c == p[0].c + 1));
+        let bayer = solid_bayer(1928, 1092, 10, 10, 10);
+        let mut out = vec![0u8; 1920 * 1080 * 3];
+        d.run_rgb(&bayer, &mut out);
+        assert!(out.iter().all(|&v| v == 10));
     }
 
     #[test]
-    fn debayer_upscales_and_handles_tiny_outputs_without_panicking() {
-        let bayer = solid_bayer(2, 2, 1, 2, 3);
-        let d = Debayer::new(2, 2, 6, 4);
-        let mut out = vec![0u8; 6 * 4 * 4];
-        d.run(&bayer, &mut out);
-        assert!(out.chunks_exact(4).all(|p| p == [3, 2, 1, 0]));
+    fn other_sizes_use_centred_aspect_region() {
+        // 4:3 into the 1928x1092 sensor: 1456 wide, centred at offset 236.
+        let d = Debayer::new(1928, 1092, 640, 480);
+        assert!(d.cols[0].c >= 236 && d.cols[639].c < 236 + 1456);
+        assert!(d.rows[0].c < 3 && d.rows[479].c > 1088);
+        // 16:9 is wider than the sensor allows: full width, 1084 high.
+        let d = Debayer::new(1928, 1092, 1280, 720);
+        assert!(d.cols[0].c < 3 && d.cols[1279].c > 1925);
+        assert!(d.rows[0].c >= 4 && d.rows[719].c < 1088);
+    }
 
+    #[test]
+    fn tiny_and_upscaled_outputs_do_not_panic() {
+        let bayer = solid_bayer(2, 2, 1, 2, 3);
+        let d = Debayer::new(2, 2, 1, 1);
+        assert_eq!(rgb_of(&d, &bayer, 1).len(), 3);
+        let d = Debayer::new(2, 2, 6, 4);
+        let want = [1u8, 2u8, 3u8];
+        for px in rgb_of(&d, &bayer, 24).chunks_exact(3) {
+            assert_eq!(px, want);
+        }
         let bayer = solid_bayer(8, 8, 1, 2, 3);
         let d = Debayer::new(8, 8, 1, 1);
-        let mut out = vec![0u8; 4];
-        d.run(&bayer, &mut out);
-        assert_eq!(out, [3, 2, 1, 0]);
+        assert_eq!(rgb_of(&d, &bayer, 1), [1u8, 2u8, 3u8]);
+        let d = Debayer::new(8, 8, 32, 2);
+        let mut yuyv = vec![0u8; 32 * 2 * 2];
+        d.run_yuyv(&bayer, &mut yuyv);
     }
 
     #[test]
-    fn debayer_applies_and_saturates_white_balance() {
+    fn white_balance_applies_and_saturates() {
         let (w, h) = (4, 4);
         let bayer = solid_bayer(w, h, 100, 150, 200);
         let mut d = Debayer::new(w, h, w, h);
         d.wb = (96, 128);
-        let mut out = vec![0u8; w * h * 4];
-        d.run(&bayer, &mut out);
-        // R 100*96/64 = 150, B 200*128/64 = 400, saturates to 255
-        assert_eq!(&out[..4], [255, 150, 150, 0]);
+        // R 100*96/64 = 150, B 200*128/64 = 400 saturates to 255
+        let want = [150u8, 150u8, 255u8];
+        assert_eq!(&rgb_of(&d, &bayer, 16)[..3], want);
     }
 
     #[test]
-    fn debayer_picks_quads_by_position() {
-        // Left quad and right quad differ; a 2x1 output samples one each.
-        let (w, h) = (4, 2);
-        let bayer = [10, 200, 10, 20, 30, 10, 40, 10];
-        let d = Debayer::new(w, h, 2, 1);
-        let mut out = vec![0u8; 8];
-        d.run(&bayer, &mut out);
-        assert_eq!(&out[..4], [30, 10, 200, 0]);
-        assert_eq!(&out[4..], [40, 10, 20, 0]);
+    fn bilinear_averages_neighbours() {
+        // Pixel (0,0) is G on an even row: R from the right neighbour (the
+        // left mirrors onto it), B from the row below (the row above mirrors).
+        let bayer = [
+            50, 100, 50, 100, 40, 50, 40, 50, 50, 100, 50, 100, 40, 50, 40, 50,
+        ];
+        let d = Debayer::new(4, 4, 4, 4);
+        let out = rgb_of(&d, &bayer, 16);
+        assert_eq!(&out[..3], [100u8, 50u8, 40u8]);
+        // (1,0) is R: G is the average of 4 edges (50,50,50,50), B of diagonals.
+        assert_eq!(&out[3..6], [100u8, 50u8, 40u8]);
     }
 
-    fn yuyv_of(b: u8, g: u8, r: u8) -> [u8; 4] {
-        let src = [b, g, r, 0, b, g, r, 0];
-        let mut out = [0u8; 4];
-        bgrx_to_yuyv(&src, &mut out);
-        out
+    fn yuyv_solid(r: u8, g: u8, b: u8) -> [u8; 4] {
+        let bayer = solid_bayer(4, 4, r, g, b);
+        let d = Debayer::new(4, 4, 2, 2);
+        let mut out = vec![0u8; 8];
+        d.run_yuyv(&bayer, &mut out);
+        assert_eq!(out[..4], out[4..]);
+        [out[0], out[1], out[2], out[3]]
     }
 
     fn near(a: u8, b: u8) -> bool {
@@ -371,40 +574,33 @@ mod tests {
 
     #[test]
     fn yuyv_white_and_black() {
-        let w = yuyv_of(255, 255, 255);
+        let w = yuyv_solid(255, 255, 255);
         assert!(near(w[0], 235) && near(w[2], 235), "{w:?}");
         assert!(near(w[1], 128) && near(w[3], 128), "{w:?}");
-        let k = yuyv_of(0, 0, 0);
-        assert!(near(k[0], 16) && near(k[2], 16), "{k:?}");
-        assert!(near(k[1], 128) && near(k[3], 128), "{k:?}");
+        assert_eq!(yuyv_solid(0, 0, 0), [16, 128, 16, 128]);
     }
 
     #[test]
     fn yuyv_primaries_have_expected_chroma_direction() {
-        let red = yuyv_of(0, 0, 255);
+        let red = yuyv_solid(255, 0, 0);
         assert!(red[1] < 128 && red[3] > 128);
-        let blue = yuyv_of(255, 0, 0);
+        let blue = yuyv_solid(0, 0, 255);
         assert!(blue[1] > 128 && blue[3] < 128);
     }
 
     #[test]
-    fn black_yuyv_matches_converted_black_frame() {
+    fn black_fill_matches_converted_black_frame() {
         let (w, h) = (8, 4);
-        let black = black_yuyv(w, h);
-        assert_eq!(black.len(), w * h * 2);
-        let mut conv = vec![0u8; w * h * 2];
-        bgrx_to_yuyv(&vec![0u8; w * h * 4], &mut conv);
-        for (a, b) in black.iter().zip(&conv) {
-            assert!(near(*a, *b));
-        }
+        let mut black = vec![0u8; w * h * 2];
+        fill_black_yuyv(&mut black);
+        let d = Debayer::new(w, h, w, h);
+        let mut conv = vec![1u8; w * h * 2];
+        d.run_yuyv(&vec![0u8; w * h], &mut conv);
+        assert_eq!(black, conv);
     }
 
     #[test]
-    fn ppm_has_header_and_rgb_order() {
-        let bgrx = [1, 2, 3, 0, 4, 5, 6, 0];
-        let ppm = bgrx_to_ppm(&bgrx, 2, 1);
-        let header = b"P6\n2 1\n255\n";
-        assert_eq!(&ppm[..header.len()], header);
-        assert_eq!(&ppm[header.len()..], [3, 2, 1, 6, 5, 4]);
+    fn ppm_header_format() {
+        assert_eq!(ppm_header(2, 1), b"P6\n2 1\n255\n");
     }
 }
