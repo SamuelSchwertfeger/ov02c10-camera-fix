@@ -261,12 +261,13 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
         warn!(
             "this v4l2loopback has no reader events; detecting readers by open handles \
              instead. Apps that reach the camera through PipeWire are not detected in this \
-             mode. scripts/setup.sh installs a v4l2loopback that supports events"
+             mode. A newer v4l2loopback adds reader events (see the README)"
         );
     }
     let target = fs::canonicalize(&cfg.loopback_device)
         .unwrap_or_else(|_| cfg.loopback_device.clone().into());
     let mut last_poll: Option<Instant> = None;
+    let mut seen_before = false;
     let idle = Duration::from_secs(cfg.idle_secs);
     let mut gain = cfg.analogue_gain;
     let mut stream: Option<Stream> = None;
@@ -287,15 +288,20 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
             // The scan is too heavy for every frame: look once a second.
             if last_poll.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
                 last_poll = Some(Instant::now());
-                let reading = has_reader(&target);
+                // Two sightings in a row to start: an app listing cameras
+                // opens the device for a moment and should not wake the sensor.
+                let seen = has_reader(&target);
+                let reading = seen && (seen_before || wanted);
+                seen_before = seen;
                 if reading != wanted {
                     debug!("reader present: {reading}");
                     wanted = reading;
                     idle_since = (!reading).then(Instant::now);
                 }
             }
-            // Idle: sleep instead of spinning, as the event wait does.
-            if stream.is_none() && !wanted {
+            // Idle or waiting to retry: sleep instead of spinning, as the
+            // event wait does.
+            if stream.is_none() && (!wanted || retry_at.is_some_and(|t| Instant::now() < t)) {
                 thread::sleep(Duration::from_secs(1));
             }
         }

@@ -117,6 +117,9 @@ pub struct Debayer {
     width: usize,
     cols: Vec<Axis>,
     rows: Vec<Axis>,
+    /// First sensor column of a 1:1 crop that never touches the left or
+    /// right border, which lets `run_yuyv` take its fast path.
+    crop_x: Option<usize>,
     /// Red and blue white-balance gains, /64 fixed point.
     pub wb: (u16, u16),
 }
@@ -127,6 +130,21 @@ fn avg2(a: u8, b: u8) -> u32 {
 
 fn avg4(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32 + b as u32 + c as u32 + d as u32 + 2) >> 2
+}
+
+/// Pack two horizontally adjacent RGB pixels as one YUYV group.
+#[inline(always)]
+fn put_yuyv(dst: &mut [u8], p0: [i32; 3], p1: [i32; 3]) {
+    let luma = |[r, g, b]: [i32; 3]| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
+    let (r, g, b) = (
+        (p0[0] + p1[0]) / 2,
+        (p0[1] + p1[1]) / 2,
+        (p0[2] + p1[2]) / 2,
+    );
+    dst[0] = luma(p0);
+    dst[1] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
+    dst[2] = luma(p1);
+    dst[3] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
 }
 
 impl Debayer {
@@ -164,8 +182,10 @@ impl Debayer {
                 })
                 .collect()
         };
+        let fast = rw == out_width && x0 >= 1 && x0 + out_width < width && out_width % 2 == 0;
         Self {
             width,
+            crop_x: fast.then_some(x0),
             cols: axis(width, rw, x0, out_width),
             rows: axis(height, rh, y0, out_height),
             wb: (WB_UNITY, WB_UNITY),
@@ -178,21 +198,30 @@ impl Debayer {
         (row(ay.lo), row(ay.c), row(ay.hi), ay.c & 1 == 1)
     }
 
-    /// White-balanced (r, g, b) at one output column.
-    fn pixel(&self, (up, cur, dn, odd_row): Rows, a: &Axis) -> [i32; 3] {
-        let (x, l, r) = (a.c, a.lo, a.hi);
-        let (red, green, blue) = match (odd_row, x & 1 == 1) {
-            (false, false) => (avg2(cur[l], cur[r]), cur[x] as u32, avg2(up[x], dn[x])),
-            (true, true) => (avg2(up[x], dn[x]), cur[x] as u32, avg2(cur[l], cur[r])),
+    /// White-balanced (r, g, b) of the centre of a 3x3 neighbourhood, each
+    /// row given as [left, centre, right]. The parities are constants at
+    /// every call on the fast path, so the match folds away there.
+    #[inline(always)]
+    fn rgb(
+        &self,
+        odd_row: bool,
+        odd_col: bool,
+        up: [u8; 3],
+        cur: [u8; 3],
+        dn: [u8; 3],
+    ) -> [i32; 3] {
+        let (red, green, blue) = match (odd_row, odd_col) {
+            (false, false) => (avg2(cur[0], cur[2]), cur[1] as u32, avg2(up[1], dn[1])),
+            (true, true) => (avg2(up[1], dn[1]), cur[1] as u32, avg2(cur[0], cur[2])),
             (false, true) => (
-                cur[x] as u32,
-                avg4(cur[l], cur[r], up[x], dn[x]),
-                avg4(up[l], up[r], dn[l], dn[r]),
+                cur[1] as u32,
+                avg4(cur[0], cur[2], up[1], dn[1]),
+                avg4(up[0], up[2], dn[0], dn[2]),
             ),
             (true, false) => (
-                avg4(up[l], up[r], dn[l], dn[r]),
-                avg4(cur[l], cur[r], up[x], dn[x]),
-                cur[x] as u32,
+                avg4(up[0], up[2], dn[0], dn[2]),
+                avg4(cur[0], cur[2], up[1], dn[1]),
+                cur[1] as u32,
             ),
         };
         let red = (red * self.wb.0 as u32) >> 6;
@@ -200,25 +229,71 @@ impl Debayer {
         [red.min(255) as i32, green as i32, blue.min(255) as i32]
     }
 
+    /// White-balanced (r, g, b) at one output column.
+    fn pixel(&self, (up, cur, dn, odd_row): Rows, a: &Axis) -> [i32; 3] {
+        let (x, l, r) = (a.c, a.lo, a.hi);
+        self.rgb(
+            odd_row,
+            x & 1 == 1,
+            [up[l], up[x], up[r]],
+            [cur[l], cur[x], cur[r]],
+            [dn[l], dn[x], dn[r]],
+        )
+    }
+
+    /// One output row of a 1:1 crop. The row slices start one sensor pixel
+    /// left of the first output pixel and end one right of the last.
+    #[inline(always)]
+    fn crop_row(&self, odd_row: bool, odd_col: bool, src: [&[u8]; 3], dst: &mut [u8]) {
+        let quads = src[0]
+            .windows(4)
+            .step_by(2)
+            .zip(src[1].windows(4).step_by(2))
+            .zip(src[2].windows(4).step_by(2));
+        for (d, ((u, c), n)) in dst.chunks_exact_mut(4).zip(quads) {
+            let p0 = self.rgb(
+                odd_row,
+                odd_col,
+                [u[0], u[1], u[2]],
+                [c[0], c[1], c[2]],
+                [n[0], n[1], n[2]],
+            );
+            let p1 = self.rgb(
+                odd_row,
+                !odd_col,
+                [u[1], u[2], u[3]],
+                [c[1], c[2], c[3]],
+                [n[1], n[2], n[3]],
+            );
+            put_yuyv(d, p0, p1);
+        }
+    }
+
     /// Fill `out` (out_width * out_height * 2 bytes) with YUYV (YUY2), BT.601
     /// limited range. Chroma is averaged over each horizontal pixel pair, so
     /// the output width must be even.
     pub fn run_yuyv(&self, bayer: &[u8], out: &mut [u8]) {
-        let luma = |[r, g, b]: [i32; 3]| (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16) as u8;
         let stride = self.cols.len() * 2;
-        for (row, ay) in out.chunks_exact_mut(stride).zip(&self.rows) {
+        let rows = out.chunks_exact_mut(stride).zip(&self.rows);
+        if let Some(x0) = self.crop_x {
+            let span = x0 - 1..x0 + self.cols.len() + 1;
+            for (row, ay) in rows {
+                let (up, cur, dn, odd_row) = self.rows_of(bayer, ay);
+                let src = [&up[span.clone()], &cur[span.clone()], &dn[span.clone()]];
+                // Spelled out so each parity gets its own branch-free loop.
+                match (odd_row, x0 & 1 == 1) {
+                    (false, false) => self.crop_row(false, false, src, row),
+                    (false, true) => self.crop_row(false, true, src, row),
+                    (true, false) => self.crop_row(true, false, src, row),
+                    (true, true) => self.crop_row(true, true, src, row),
+                }
+            }
+            return;
+        }
+        for (row, ay) in rows {
             let src = self.rows_of(bayer, ay);
             for (dst, pair) in row.chunks_exact_mut(4).zip(self.cols.chunks_exact(2)) {
-                let (p0, p1) = (self.pixel(src, &pair[0]), self.pixel(src, &pair[1]));
-                let (r, g, b) = (
-                    (p0[0] + p1[0]) / 2,
-                    (p0[1] + p1[1]) / 2,
-                    (p0[2] + p1[2]) / 2,
-                );
-                dst[0] = luma(p0);
-                dst[1] = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128) as u8;
-                dst[2] = luma(p1);
-                dst[3] = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128) as u8;
+                put_yuyv(dst, self.pixel(src, &pair[0]), self.pixel(src, &pair[1]));
             }
         }
     }
@@ -266,6 +341,47 @@ mod tests {
             }
         }
         v
+    }
+
+    #[test]
+    fn crop_fast_path_matches_general_path() {
+        // Even and odd crop offsets, so all four parity kernels run.
+        for (w, h) in [(40, 30), (38, 28)] {
+            let mut seed = 12345u32;
+            let bayer: Vec<u8> = (0..w * h)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let mut d = Debayer::new(w, h, 32, 22);
+            d.wb = (90, 110);
+            assert!(d.crop_x.is_some());
+            let mut fast = vec![0u8; 32 * 22 * 2];
+            d.run_yuyv(&bayer, &mut fast);
+            d.crop_x = None;
+            let mut general = vec![0u8; 32 * 22 * 2];
+            d.run_yuyv(&bayer, &mut general);
+            assert_eq!(fast, general);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing only: cargo test --release -- --ignored --nocapture"]
+    fn bench_1080p() {
+        let bayer = vec![100u8; 1928 * 1092];
+        let mut out = vec![0u8; 1920 * 1080 * 2];
+        let mut d = Debayer::new(1928, 1092, 1920, 1080);
+        for fast in [true, false] {
+            if !fast {
+                d.crop_x = None;
+            }
+            let t = std::time::Instant::now();
+            for _ in 0..50 {
+                d.run_yuyv(std::hint::black_box(&bayer), &mut out);
+            }
+            println!("fast={fast}: {:?}/frame", t.elapsed() / 50);
+        }
     }
 
     fn le_bytes(vals: &[u16]) -> Vec<u8> {

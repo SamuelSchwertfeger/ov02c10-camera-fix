@@ -70,7 +70,8 @@ if [ "$1" = configure ]; then
         if command -v loginctl >/dev/null 2>&1; then
             loginctl list-users --no-legend 2>/dev/null | while read -r _ user _; do
                 systemctl --user --machine="$user@.host" daemon-reload 2>/dev/null || true
-                systemctl --user --machine="$user@.host" restart ov02c10-camera.service 2>/dev/null || true
+                systemctl --user --machine="$user@.host" restart ov02c10-camera.service 2>/dev/null ||
+                    echo "ov02c10-camera: not started for $user; it starts at their next login (or: systemctl --user start ov02c10-camera)"
             done || true
         fi
     fi

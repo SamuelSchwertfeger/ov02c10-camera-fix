@@ -36,6 +36,9 @@ install: deb ## Install the package (enables and starts the on-demand camera ser
 		~/.config/systemd/user/ov02c10-camera.service.d \
 		~/.config/systemd/user/ov02c10-camera-watcher.service
 	sudo apt-get install -y --reinstall ./$(DEB)
+	@# The package starts it too; this covers sessions it could not reach.
+	-systemctl --user daemon-reload
+	-systemctl --user restart ov02c10-camera
 
 uninstall: ## Remove the package (stops and disables the service)
 	sudo apt-get remove -y ov02c10-camera
