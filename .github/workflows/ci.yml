@@ -69,6 +69,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y ./dist/ov02c10-camera_amd64.deb
+          systemctl --global is-enabled ov02c10-camera.service
           ov02c10-camera --version
           ov02c10-camera --help
           ! readelf -lW /usr/bin/ov02c10-camera | grep -q INTERP

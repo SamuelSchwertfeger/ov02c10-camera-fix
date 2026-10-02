@@ -4,9 +4,12 @@ Documentation=https://github.com/SamuelSchwertfeger/ov02c10-camera-fix
 
 # One always-on process. It keeps /dev/video48 visible as a camera at almost
 # no cost and only powers the sensor while an application is streaming.
+# Keep retrying forever if the camera or /dev/video48 is not ready at login.
+StartLimitIntervalSec=0
+
 [Service]
 ExecStart=/usr/bin/ov02c10-camera --on-demand
-Restart=on-failure
+Restart=always
 RestartSec=3
 # Safety net: a regression that leaks gets the service killed and restarted,
 # one that spins gets throttled, instead of taking the machine down.

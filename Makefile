@@ -29,19 +29,15 @@ build: ## Build the release binary
 deb: build ## Build the .deb package
 	./scripts/build-deb.sh $(BIN)
 
-install: deb ## Install the package and start the on-demand camera service
+install: deb ## Install the package (enables and starts the on-demand camera service)
 	@# Units left behind by the Python version would shadow the packaged one.
 	-systemctl --user disable --now ov02c10-camera-watcher 2>/dev/null
 	rm -rf ~/.config/systemd/user/ov02c10-camera.service \
 		~/.config/systemd/user/ov02c10-camera.service.d \
 		~/.config/systemd/user/ov02c10-camera-watcher.service
 	sudo apt-get install -y --reinstall ./$(DEB)
-	systemctl --user daemon-reload
-	systemctl --user enable ov02c10-camera
-	systemctl --user restart ov02c10-camera
 
-uninstall: ## Stop the service and remove the package
-	-systemctl --user disable --now ov02c10-camera
+uninstall: ## Remove the package (stops and disables the service)
 	sudo apt-get remove -y ov02c10-camera
 
 clean: ## Remove build artifacts

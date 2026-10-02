@@ -169,7 +169,7 @@ fn free_device(device: &str) {
         }
         let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
         let comm = comm.trim();
-        if CRITICAL_PROCESSES.contains(&comm) {
+        if !counts_as_reader(comm) {
             info!("{comm} (pid {pid}) holds {device}: leaving it alone");
         } else {
             warn!("{device} is held by {comm} (pid {pid}): killing it");
@@ -180,6 +180,33 @@ fn free_device(device: &str) {
     if killed {
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+/// Whether a process holding the loopback device open is an application
+/// that wants frames. The desktop's media services keep a permanent
+/// monitoring handle and never count.
+fn counts_as_reader(comm: &str) -> bool {
+    !CRITICAL_PROCESSES.contains(&comm.trim())
+}
+
+/// Whether any other process that counts as a reader holds `target` open.
+fn has_reader(target: &Path) -> bool {
+    let me = std::process::id();
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                return false;
+            };
+            pid != me
+                && holds(&entry.path().join("fd"), target)
+                && counts_as_reader(
+                    &fs::read_to_string(entry.path().join("comm")).unwrap_or_default(),
+                )
+        })
 }
 
 /// Whether any fd in a `/proc/<pid>/fd` directory points at `target`.
@@ -226,13 +253,20 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     lb.write(&yuyv)?;
     info!("{} is ready ({w}x{h} YUYV)", cfg.loopback_device);
 
-    let on_demand = on_demand && {
-        let supported = lb.subscribe();
-        if !supported {
-            warn!("this v4l2loopback has no reader events; running the sensor continuously");
-        }
-        supported
-    };
+    let events = on_demand && lb.subscribe();
+    // ponytail: apps that reach the camera through PipeWire are invisible to
+    // the handle scan, upgrade path is a v4l2loopback with reader events.
+    let polling = on_demand && !events;
+    if polling {
+        warn!(
+            "this v4l2loopback has no reader events; detecting readers by open handles \
+             instead. Apps that reach the camera through PipeWire are not detected in this \
+             mode. scripts/setup.sh installs a v4l2loopback that supports events"
+        );
+    }
+    let target = fs::canonicalize(&cfg.loopback_device)
+        .unwrap_or_else(|_| cfg.loopback_device.clone().into());
+    let mut last_poll: Option<Instant> = None;
     let idle = Duration::from_secs(cfg.idle_secs);
     let mut gain = cfg.analogue_gain;
     let mut stream: Option<Stream> = None;
@@ -241,13 +275,28 @@ fn loopback(cfg: &Config, on_demand: bool) -> io::Result<()> {
     let mut retry_at: Option<Instant> = None;
 
     while !stopping() {
-        if on_demand {
+        if events {
             // Sleep on the event while idle, only peek while streaming.
             let timeout_ms = if stream.is_some() { 0 } else { 1000 };
             if let Some(reading) = lb.reader_change(timeout_ms)? {
                 debug!("reader streaming: {reading}");
                 wanted = reading;
                 idle_since = (!reading).then(Instant::now);
+            }
+        } else if polling {
+            // The scan is too heavy for every frame: look once a second.
+            if last_poll.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                last_poll = Some(Instant::now());
+                let reading = has_reader(&target);
+                if reading != wanted {
+                    debug!("reader present: {reading}");
+                    wanted = reading;
+                    idle_since = (!reading).then(Instant::now);
+                }
+            }
+            // Idle: sleep instead of spinning, as the event wait does.
+            if stream.is_none() && !wanted {
+                thread::sleep(Duration::from_secs(1));
             }
         }
         let expired = !wanted && idle_since.is_none_or(|t| t.elapsed() >= idle);
@@ -318,5 +367,20 @@ pub fn run(cfg: &Config) -> io::Result<()> {
         Mode::Snapshot(path) => snapshot(cfg, path),
         Mode::Loopback => loopback(cfg, false),
         Mode::OnDemand => loopback(cfg, true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn media_services_never_count_as_readers() {
+        for comm in CRITICAL_PROCESSES {
+            assert!(!counts_as_reader(comm));
+            assert!(!counts_as_reader(&format!("{comm}\n")));
+        }
+        assert!(counts_as_reader("firefox"));
+        assert!(counts_as_reader("pipewire-pulse"));
     }
 }
