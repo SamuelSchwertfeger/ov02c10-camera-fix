@@ -83,6 +83,10 @@ Things to know:
 
 - If `v4l2loopback` was already loaded with other options, reload it so
   `/dev/video48` exists: `sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback`.
+- The picture is turned 180 degrees, because the sensor is mounted upside
+  down and current kernels no longer flip it. If yours comes out upside
+  down, your kernel still flips it: add `--no-rotate` to `ExecStart` with
+  `systemctl --user edit --full ov02c10-camera`.
 - If you previously ran the Python version's `make install`, remove its
   units first, since they take precedence over the packaged one:
   ```bash

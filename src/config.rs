@@ -37,6 +37,9 @@ pub struct Config {
     pub ae_target: f64,
     /// On-demand mode: seconds without a reader before the sensor stops.
     pub idle_secs: u64,
+    /// Turn the picture 180 degrees: the sensor is mounted upside down and
+    /// current kernels no longer flip it in the driver.
+    pub rotate_180: bool,
     pub verbose: bool,
     pub mode: Mode,
 }
@@ -58,6 +61,7 @@ impl Default for Config {
             auto_exposure: true,
             ae_target: 128.0,
             idle_secs: 5,
+            rotate_180: true,
             verbose: false,
             mode: Mode::Loopback,
         }
@@ -87,6 +91,8 @@ OPTIONS:
     --no-auto-exposure         Keep analogue gain fixed
     --ae-target <1-255>        Auto-exposure brightness target [128]
     --idle-secs <N>            On-demand: stop sensor after N s unused [5]
+    --no-rotate                Do not turn the picture 180 degrees
+                               (for kernels whose driver already does)
     -v, --verbose              Debug logging
     -h, --help                 Show this help
     -V, --version              Show version
@@ -121,6 +127,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Config, Str
             "--no-auto-exposure" => cfg.auto_exposure = false,
             "--ae-target" => cfg.ae_target = value(&arg, &mut it)?,
             "--idle-secs" => cfg.idle_secs = value(&arg, &mut it)?,
+            "--no-rotate" => cfg.rotate_180 = false,
             "-v" | "--verbose" => cfg.verbose = true,
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -164,6 +171,8 @@ mod tests {
         assert_eq!(cfg.output_width, 1920);
         assert_eq!(cfg.output_height, 1080);
         assert!(cfg.auto_exposure);
+        assert!(cfg.rotate_180);
+        assert!(!parse(&["--loopback", "--no-rotate"]).unwrap().rotate_180);
     }
 
     #[test]
