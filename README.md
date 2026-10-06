@@ -12,7 +12,8 @@ Teams, Zoom, Discord, etc.
 This is a Rust rewrite of [Seth Barrett's original Python
 implementation](https://github.com/sethbarrett50/ov02c10-camera-fix). The
 hardware investigation and the capture recipe are his; see
-[`docs/DEBUGGING.md`](docs/DEBUGGING.md).
+[`docs/DEBUGGING.md`](docs/DEBUGGING.md). He also tested every release of this
+version on his own laptop.
 
 ## What changed in the rewrite
 
