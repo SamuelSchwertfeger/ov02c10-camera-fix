@@ -120,6 +120,8 @@ pub struct Debayer {
     /// First sensor column of a 1:1 crop that never touches the left or
     /// right border, which lets `run_yuyv` take its fast path.
     crop_x: Option<usize>,
+    /// Picture turned 180 degrees (rows and columns walked backwards).
+    rotated: bool,
     /// Red and blue white-balance gains, /64 fixed point.
     pub wb: (u16, u16),
 }
@@ -186,10 +188,19 @@ impl Debayer {
         Self {
             width,
             crop_x: fast.then_some(x0),
+            rotated: false,
             cols: axis(width, rw, x0, out_width),
             rows: axis(height, rh, y0, out_height),
             wb: (WB_UNITY, WB_UNITY),
         }
+    }
+
+    /// Turn the picture 180 degrees, for a sensor mounted upside down.
+    /// Colour parity comes from sensor coordinates, so colours stay right.
+    pub fn rotate_180(&mut self) {
+        self.cols.reverse();
+        self.rows.reverse();
+        self.rotated = !self.rotated;
     }
 
     fn rows_of<'a>(&self, bayer: &'a [u8], ay: &Axis) -> Rows<'a> {
@@ -242,30 +253,77 @@ impl Debayer {
     }
 
     /// One output row of a 1:1 crop. The row slices start one sensor pixel
-    /// left of the first output pixel and end one right of the last.
+    /// left of the first output pixel and end one right of the last. `ROT`
+    /// writes the row right to left, for the 180 degree turn.
     #[inline(always)]
-    fn crop_row(&self, odd_row: bool, odd_col: bool, src: [&[u8]; 3], dst: &mut [u8]) {
+    fn crop_row<const ROT: bool>(
+        &self,
+        odd_row: bool,
+        odd_col: bool,
+        src: [&[u8]; 3],
+        dst: &mut [u8],
+    ) {
         let quads = src[0]
             .windows(4)
             .step_by(2)
             .zip(src[1].windows(4).step_by(2))
             .zip(src[2].windows(4).step_by(2));
-        for (d, ((u, c), n)) in dst.chunks_exact_mut(4).zip(quads) {
-            let p0 = self.rgb(
-                odd_row,
-                odd_col,
-                [u[0], u[1], u[2]],
-                [c[0], c[1], c[2]],
-                [n[0], n[1], n[2]],
-            );
-            let p1 = self.rgb(
-                odd_row,
-                !odd_col,
-                [u[1], u[2], u[3]],
-                [c[1], c[2], c[3]],
-                [n[1], n[2], n[3]],
-            );
-            put_yuyv(d, p0, p1);
+        // Plain loops with the body written out: hiding it behind a
+        // closure costs about 40% here (measured).
+        if ROT {
+            // Output written right to left: pixels swap within each group.
+            for (d, ((u, c), n)) in dst.chunks_exact_mut(4).rev().zip(quads) {
+                let p0 = self.rgb(
+                    odd_row,
+                    odd_col,
+                    [u[0], u[1], u[2]],
+                    [c[0], c[1], c[2]],
+                    [n[0], n[1], n[2]],
+                );
+                let p1 = self.rgb(
+                    odd_row,
+                    !odd_col,
+                    [u[1], u[2], u[3]],
+                    [c[1], c[2], c[3]],
+                    [n[1], n[2], n[3]],
+                );
+                put_yuyv(d, p1, p0);
+            }
+        } else {
+            for (d, ((u, c), n)) in dst.chunks_exact_mut(4).zip(quads) {
+                let p0 = self.rgb(
+                    odd_row,
+                    odd_col,
+                    [u[0], u[1], u[2]],
+                    [c[0], c[1], c[2]],
+                    [n[0], n[1], n[2]],
+                );
+                let p1 = self.rgb(
+                    odd_row,
+                    !odd_col,
+                    [u[1], u[2], u[3]],
+                    [c[1], c[2], c[3]],
+                    [n[1], n[2], n[3]],
+                );
+                put_yuyv(d, p0, p1);
+            }
+        }
+    }
+
+    /// The whole frame through `crop_row`, starting at sensor column `x0`.
+    #[inline(always)]
+    fn crop_rows<const ROT: bool>(&self, bayer: &[u8], out: &mut [u8], x0: usize) {
+        let span = x0 - 1..x0 + self.cols.len() + 1;
+        for (row, ay) in out.chunks_exact_mut(self.cols.len() * 2).zip(&self.rows) {
+            let (up, cur, dn, odd_row) = self.rows_of(bayer, ay);
+            let src = [&up[span.clone()], &cur[span.clone()], &dn[span.clone()]];
+            // Spelled out so each parity gets its own branch-free loop.
+            match (odd_row, x0 & 1 == 1) {
+                (false, false) => self.crop_row::<ROT>(false, false, src, row),
+                (false, true) => self.crop_row::<ROT>(false, true, src, row),
+                (true, false) => self.crop_row::<ROT>(true, false, src, row),
+                (true, true) => self.crop_row::<ROT>(true, true, src, row),
+            }
         }
     }
 
@@ -273,23 +331,12 @@ impl Debayer {
     /// limited range. Chroma is averaged over each horizontal pixel pair, so
     /// the output width must be even.
     pub fn run_yuyv(&self, bayer: &[u8], out: &mut [u8]) {
-        let stride = self.cols.len() * 2;
-        let rows = out.chunks_exact_mut(stride).zip(&self.rows);
-        if let Some(x0) = self.crop_x {
-            let span = x0 - 1..x0 + self.cols.len() + 1;
-            for (row, ay) in rows {
-                let (up, cur, dn, odd_row) = self.rows_of(bayer, ay);
-                let src = [&up[span.clone()], &cur[span.clone()], &dn[span.clone()]];
-                // Spelled out so each parity gets its own branch-free loop.
-                match (odd_row, x0 & 1 == 1) {
-                    (false, false) => self.crop_row(false, false, src, row),
-                    (false, true) => self.crop_row(false, true, src, row),
-                    (true, false) => self.crop_row(true, false, src, row),
-                    (true, true) => self.crop_row(true, true, src, row),
-                }
-            }
-            return;
+        match (self.crop_x, self.rotated) {
+            (Some(x0), false) => return self.crop_rows::<false>(bayer, out, x0),
+            (Some(x0), true) => return self.crop_rows::<true>(bayer, out, x0),
+            (None, _) => {}
         }
+        let rows = out.chunks_exact_mut(self.cols.len() * 2).zip(&self.rows);
         for (row, ay) in rows {
             let src = self.rows_of(bayer, ay);
             for (dst, pair) in row.chunks_exact_mut(4).zip(self.cols.chunks_exact(2)) {
@@ -354,15 +401,20 @@ mod tests {
                     (seed >> 24) as u8
                 })
                 .collect();
-            let mut d = Debayer::new(w, h, 32, 22);
-            d.wb = (90, 110);
-            assert!(d.crop_x.is_some());
-            let mut fast = vec![0u8; 32 * 22 * 2];
-            d.run_yuyv(&bayer, &mut fast);
-            d.crop_x = None;
-            let mut general = vec![0u8; 32 * 22 * 2];
-            d.run_yuyv(&bayer, &mut general);
-            assert_eq!(fast, general);
+            for rotate in [false, true] {
+                let mut d = Debayer::new(w, h, 32, 22);
+                d.wb = (90, 110);
+                if rotate {
+                    d.rotate_180();
+                }
+                assert!(d.crop_x.is_some());
+                let mut fast = vec![0u8; 32 * 22 * 2];
+                d.run_yuyv(&bayer, &mut fast);
+                d.crop_x = None;
+                let mut general = vec![0u8; 32 * 22 * 2];
+                d.run_yuyv(&bayer, &mut general);
+                assert_eq!(fast, general);
+            }
         }
     }
 
@@ -372,7 +424,10 @@ mod tests {
         let bayer = vec![100u8; 1928 * 1092];
         let mut out = vec![0u8; 1920 * 1080 * 2];
         let mut d = Debayer::new(1928, 1092, 1920, 1080);
-        for fast in [true, false] {
+        for (fast, rotate) in [(true, false), (true, true), (false, true)] {
+            if rotate && !d.rotated {
+                d.rotate_180();
+            }
             if !fast {
                 d.crop_x = None;
             }
@@ -380,7 +435,22 @@ mod tests {
             for _ in 0..50 {
                 d.run_yuyv(std::hint::black_box(&bayer), &mut out);
             }
-            println!("fast={fast}: {:?}/frame", t.elapsed() / 50);
+            println!("fast={fast} rotate={rotate}: {:?}/frame", t.elapsed() / 50);
+        }
+    }
+
+    #[test]
+    fn rotate_180_reverses_rows_and_columns() {
+        // Distinct value per pixel, so any misplaced sample shows.
+        let (w, h) = (6, 4);
+        let bayer: Vec<u8> = (0..(w * h) as u8).map(|v| v * 10).collect();
+        let mut d = Debayer::new(w, h, w, h);
+        let plain = rgb_of(&d, &bayer, w * h);
+        d.rotate_180();
+        let turned = rgb_of(&d, &bayer, w * h);
+        for (i, px) in turned.chunks_exact(3).enumerate() {
+            let j = w * h - 1 - i;
+            assert_eq!(px, &plain[j * 3..j * 3 + 3]);
         }
     }
 

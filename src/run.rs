@@ -74,7 +74,13 @@ impl Stream {
             ae: cfg
                 .auto_exposure
                 .then(|| AutoExposure::new(analogue_gain, cfg.ae_target)),
-            debayer: Debayer::new(w, h, cfg.output_width, cfg.output_height),
+            debayer: {
+                let mut d = Debayer::new(w, h, cfg.output_width, cfg.output_height);
+                if cfg.rotate_180 {
+                    d.rotate_180();
+                }
+                d
+            },
             bayer: vec![0; w * h],
             calibrating: true,
             settle: 0,
